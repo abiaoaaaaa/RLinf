@@ -13,6 +13,7 @@ docs/build
 dist
 logs/*
 logs_baseline/*
+replay_buffers/*
 outputs/*
 *.so
 .venv

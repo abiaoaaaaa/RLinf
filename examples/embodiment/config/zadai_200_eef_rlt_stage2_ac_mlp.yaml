@@ -1,0 +1,60 @@
+defaults:
+  # Reuse scheduling, replay, logging, and placement from the verified joint
+  # Stage 2 configuration. Only action/state semantics are overridden here.
+  - zadai_200_rlt_stage2_ac_mlp
+  - _self_
+
+runner:
+  logger:
+    experiment_name: "zadai_200_eef_rlt_stage2_ac_mlp"
+
+algorithm:
+  actor_action_constraint:
+    enable: True
+    action_space: eef
+    constrained_steps: 1
+    # Normalized domain layout per arm: xyz(3), rot6d(6), gripper(1).
+    # Grippers stay on the Stage1 reference at actor handoff.
+    max_reference_delta: [0.08, 0.08, 0.08,
+                          0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.0,
+                          0.08, 0.08, 0.08,
+                          0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.0]
+  replay_buffer:
+    auto_save_path: ${oc.env:ZADAI_EEF_REPLAY_BUFFER_PATH,${runner.logger.log_path}/replay_buffers/zadai_200_eef_rlt_stage2}
+  demo_buffer:
+    load_path: ${oc.env:ZADAI_EEF_DEMO_BUFFER_PATH,${runner.logger.log_path}/replay_buffers/zadai_200_eef_demo/rank_0}
+
+env:
+  train:
+    override_cfg:
+      control_space: eef
+      # Physical EEF safety is enforced after decoding the RLT action.
+      max_eef_translation_delta: 0.02
+      max_eef_chunk_translation_delta: 0.12
+      max_eef_rotation_delta_rad: 0.12
+      max_eef_angular_velocity_rad_s: 1.5
+      max_eef_chunk_rotation_delta_rad: 0.50
+  eval:
+    override_cfg:
+      control_space: eef
+      max_eef_translation_delta: 0.02
+      max_eef_chunk_translation_delta: 0.12
+      max_eef_rotation_delta_rad: 0.12
+      max_eef_angular_velocity_rad_s: 1.5
+      max_eef_chunk_rotation_delta_rad: 0.50
+
+rollout:
+  rlt_feature_model:
+    model_path: ${oc.env:ZADAI_EEF_STAGE1_CHECKPOINT}
+    openpi_data:
+      repo_id: zadai_200_eef_rot6d
+      norm_stats_path: ${oc.env:ZADAI_EEF_NORM_STATS}
+    openpi:
+      config_name: pi05_zadai_eef_rot6d
+      action_env_dim: 20
+      rlt_action_space: eef
+
+actor:
+  model:
+    proprio_dim: 20
+    action_dim: 20

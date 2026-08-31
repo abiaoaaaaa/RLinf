@@ -14,6 +14,8 @@
 
 from typing import Any
 
+import torch
+
 from rlinf.envs import SupportedEnvType
 from rlinf.utils.nested_dict_process import copy_dict_tensor
 
@@ -80,3 +82,12 @@ def update_rlt_transitions(
         pending_obs[stage_id] = extract_rlt_obs_from_forward_inputs(
             rollout_result.forward_inputs
         )
+    else:
+        # The final rollout result is generated only to provide the next RLT
+        # observation for the preceding executed chunk. Its proposed action is
+        # appended as a bootstrap row but is never sent to the environment, so
+        # it must not be admitted to transition replay even when the critical
+        # phase switch is active at the epoch boundary.
+        record_transition = rollout_result.forward_inputs.get("record_transition")
+        if isinstance(record_transition, torch.Tensor):
+            record_transition.zero_()

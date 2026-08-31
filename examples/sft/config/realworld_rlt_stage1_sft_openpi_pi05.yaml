@@ -34,8 +34,10 @@ data:
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
-  micro_batch_size: 16
-  global_batch_size: 64
+  # Single-4090 default: accumulate 16 microbatches without backpropagating
+  # through the frozen pi0.5 backbone.
+  micro_batch_size: 1
+  global_batch_size: 16
   seed: 42
 
   model:
@@ -58,9 +60,11 @@ actor:
       joint_logprob: True
       detach_critic_input: True
 
-      # Joint SFT objective: loss = rlt_loss + rlt_alpha * vla_loss.
+      # Start from a task-ready, fully fine-tuned pi0.5 checkpoint and train
+      # only the RLT token encoder/decoder. The VLA action branch is skipped.
       use_rlt: True
-      rlt_alpha: 1.0
+      rlt_train_only: True
+      rlt_alpha: 0.0
       rlt_prefix_seq_len: 1024
       rlt_image_only: False
       rlt_use_mask: True
@@ -81,7 +85,8 @@ actor:
   fsdp_config:
     strategy: "fsdp"
     sharding_strategy: "no_shard"
-    use_orig_params: False
+    # Required for a model containing both frozen and trainable parameters.
+    use_orig_params: True
     gradient_checkpointing: False
     mixed_precision:
       param_dtype: ${actor.model.precision}

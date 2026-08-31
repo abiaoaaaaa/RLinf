@@ -189,3 +189,8 @@ register(
     id="DexpnpEnv-v1",
     entry_point="rlinf.envs.realworld.franka.tasks:create_dexpnp_env",
 )
+
+register(
+    id="Zadai200Env-v1",
+    entry_point="rlinf.envs.realworld.zadai.zadai_env:create_zadai_env",
+)

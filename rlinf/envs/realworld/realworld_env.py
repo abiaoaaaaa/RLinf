@@ -31,6 +31,16 @@ from rlinf.envs.utils import to_tensor
 from rlinf.scheduler import WorkerInfo
 
 
+def _stack_vector_info(value, *, dtype: np.dtype) -> np.ndarray:
+    """Convert Gymnasium vector-info values, including object arrays."""
+    array = np.asarray(value)
+    if array.dtype != object:
+        return array.astype(dtype, copy=False)
+    if array.ndim == 0:
+        array = array.reshape(1)
+    return np.stack([np.asarray(item, dtype=dtype) for item in array], axis=0)
+
+
 class RealWorldEnv(gym.Env):
     def __init__(self, cfg, num_envs, seed_offset, total_num_processes, worker_info):
         assert num_envs == 1, (
@@ -277,6 +287,14 @@ class RealWorldEnv(gym.Env):
             infos["rlt_switch_flags"] = to_tensor(
                 np.asarray(infos["rlt_switch_flags"], dtype=bool)
             )
+        if "rlt_segment_done" in infos:
+            infos["rlt_segment_done"] = to_tensor(
+                np.asarray(infos["rlt_segment_done"], dtype=bool)
+            )
+        if "sent_action" in infos:
+            infos["sent_action"] = to_tensor(
+                _stack_vector_info(infos["sent_action"], dtype=np.float32)
+            )
 
         dones = terminations | truncations
         _auto_reset = auto_reset and self.auto_reset
@@ -293,6 +311,14 @@ class RealWorldEnv(gym.Env):
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
+        if self.override_cfg.get("action_transport") == "chunk":
+            if self.num_envs != 1:
+                raise ValueError("Native real-world action chunks require num_envs=1")
+            raw_actions = chunk_actions[0]
+            if torch.is_tensor(raw_actions):
+                raw_actions = raw_actions.detach().cpu().numpy()
+            submit_chunk = self.env.envs[0].get_wrapper_attr("begin_action_chunk")
+            submit_chunk(np.asarray(raw_actions, dtype=np.float32))
         obs_list = []
         infos_list = []
 
@@ -304,6 +330,8 @@ class RealWorldEnv(gym.Env):
         raw_chunk_intervene_actions = []
         raw_chunk_intervene_flag = []
         raw_chunk_rlt_switch_flags = []
+        raw_chunk_rlt_segment_done = []
+        raw_chunk_sent_actions = []
         for i in range(chunk_size):
             actions = chunk_actions[:, i]
             extracted_obs, step_reward, terminations, truncations, infos = self.step(
@@ -316,6 +344,10 @@ class RealWorldEnv(gym.Env):
                 raw_chunk_intervene_flag.append(infos["intervene_flag"])
             if "rlt_switch_flags" in infos:
                 raw_chunk_rlt_switch_flags.append(infos["rlt_switch_flags"])
+            if "rlt_segment_done" in infos:
+                raw_chunk_rlt_segment_done.append(infos["rlt_segment_done"])
+            if "sent_action" in infos:
+                raw_chunk_sent_actions.append(infos["sent_action"])
 
             chunk_rewards.append(step_reward)
             raw_chunk_terminations.append(terminations)
@@ -344,6 +376,14 @@ class RealWorldEnv(gym.Env):
             infos_last["rlt_switch_flags"] = torch.stack(
                 raw_chunk_rlt_switch_flags, dim=1
             )
+            infos_list[-1] = infos_last
+        if raw_chunk_rlt_segment_done:
+            infos_last["rlt_segment_done"] = torch.stack(
+                raw_chunk_rlt_segment_done, dim=1
+            )
+            infos_list[-1] = infos_last
+        if raw_chunk_sent_actions:
+            infos_last["executed_actions"] = torch.stack(raw_chunk_sent_actions, dim=1)
             infos_list[-1] = infos_last
 
         if past_dones.any() and self.auto_reset:

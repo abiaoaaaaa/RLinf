@@ -94,8 +94,19 @@ class FSDPVlaSftWorker(FSDPSftWorker):
         raise NotImplementedError("eval is not supported for embodied sft right now.")
 
     def get_train_model_output(self, batch: Any) -> tuple[torch.Tensor, dict[str, Any]]:
+        openpi_cfg = getattr(self.cfg.actor.model, "openpi", None)
+        use_action_chunk_loss = bool(
+            openpi_cfg is not None
+            and getattr(openpi_cfg, "sft_use_action_chunk_loss", False)
+        )
+        forward_kwargs = {"data": batch}
+        if use_action_chunk_loss:
+            forward_kwargs["use_action_chunk_loss"] = True
         with self.amp_context:
-            output = self.model(forward_type=ForwardType.SFT, data=batch)
+            output = self.model(
+                forward_type=ForwardType.SFT,
+                **forward_kwargs,
+            )
 
         if isinstance(output, torch.Tensor):
             loss = output

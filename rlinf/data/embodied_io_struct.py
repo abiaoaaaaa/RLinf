@@ -61,6 +61,7 @@ class EnvOutput:
 
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
+    executed_actions: Optional[torch.Tensor] = None  # [B, action_chunk, action_dim]
     rlt_switch_flags: Optional[torch.Tensor] = None  # [B] or [B, action_chunk]
 
     def __post_init__(self):
@@ -97,6 +98,11 @@ class EnvOutput:
         self.intervene_flags = (
             self.intervene_flags.cpu().contiguous()
             if self.intervene_flags is not None
+            else None
+        )
+        self.executed_actions = (
+            self.executed_actions.cpu().contiguous()
+            if self.executed_actions is not None
             else None
         )
         self.rlt_switch_flags = (
@@ -241,6 +247,11 @@ class EnvOutput:
             allow_partial_none=True,
             fill_value=False,
         )
+        merged_executed_actions = _merge_optional_tensor_field(
+            "executed_actions",
+            allow_partial_none=True,
+            fill_value=0.0,
+        )
         merged_rlt_switch_flags = _merge_optional_tensor_field(
             "rlt_switch_flags",
             allow_partial_none=True,
@@ -256,6 +267,7 @@ class EnvOutput:
             rewards=merged_rewards,
             intervene_actions=merged_intervene_actions,
             intervene_flags=merged_intervene_flags,
+            executed_actions=merged_executed_actions,
             rlt_switch_flags=merged_rlt_switch_flags,
         ).to_dict()
 
@@ -275,6 +287,7 @@ class EnvOutput:
         env_output_dict["env_infos"] = self.env_infos
         env_output_dict["intervene_actions"] = self.intervene_actions
         env_output_dict["intervene_flags"] = self.intervene_flags
+        env_output_dict["executed_actions"] = self.executed_actions
         env_output_dict["rlt_switch_flags"] = self.rlt_switch_flags
 
         return env_output_dict
@@ -672,6 +685,19 @@ class EmbodiedRolloutResult:
                         last_full_action.reshape(bsz, -1).cpu().contiguous()
                     )
                 last_fi.pop("model_action", None)
+
+    def replace_last_actions(self, executed_actions: torch.Tensor) -> None:
+        """Replace the latest replay action with the command sent by the env."""
+        if not self.actions:
+            return
+        last_action = self.actions[-1]
+        executed_actions = executed_actions.reshape(last_action.shape).to(
+            device=last_action.device,
+            dtype=last_action.dtype,
+        )
+        self.actions[-1] = executed_actions.cpu().contiguous()
+        if self.forward_inputs and "action" in self.forward_inputs[-1]:
+            self.forward_inputs[-1]["action"] = executed_actions.cpu().contiguous()
 
     def append_transitions(self, curr_obs=None, next_obs=None):
         assert curr_obs is not None and next_obs is not None

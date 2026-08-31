@@ -494,9 +494,18 @@ class EnvWorker(Worker):
             infos["intervene_action"] if "intervene_action" in infos else None
         )
         intervene_flags = infos["intervene_flag"] if "intervene_flag" in infos else None
+        executed_actions = (
+            infos["executed_actions"] if "executed_actions" in infos else None
+        )
         rlt_switch_flags = (
             infos["rlt_switch_flags"] if "rlt_switch_flags" in infos else None
         )
+        replay_terminations = chunk_terminations
+        if "rlt_segment_done" in infos:
+            replay_terminations = chunk_terminations | infos["rlt_segment_done"].to(
+                device=chunk_terminations.device,
+                dtype=torch.bool,
+            )
         if self.cfg.env.train.auto_reset and chunk_dones.any():
             if "intervene_action" in infos["final_info"]:
                 intervene_actions = infos["final_info"]["intervene_action"]
@@ -508,10 +517,11 @@ class EnvWorker(Worker):
             rewards=chunk_rewards,
             env_infos=infos if isinstance(infos, dict) else None,
             dones=chunk_dones,
-            terminations=chunk_terminations,
+            terminations=replay_terminations,
             truncations=chunk_truncations,
             intervene_actions=intervene_actions,
             intervene_flags=intervene_flags,
+            executed_actions=executed_actions,
             rlt_switch_flags=rlt_switch_flags,
         )
         chunk_step_payload = {
@@ -1039,6 +1049,10 @@ class EnvWorker(Worker):
 
                     env_output = env_outputs[stage_id]
                     curr_obs = env_output.obs
+                    if env_output.executed_actions is not None:
+                        self.rollout_results[stage_id].replace_last_actions(
+                            env_output.executed_actions
+                        )
                     if env_output.intervene_actions is not None:
                         self.rollout_results[stage_id].update_last_actions(
                             env_output.intervene_actions,
@@ -1153,6 +1167,10 @@ class EnvWorker(Worker):
 
             for stage_id in range(self.stage_num):
                 env_output = env_outputs[stage_id]
+                if env_output.executed_actions is not None:
+                    self.rollout_results[stage_id].replace_last_actions(
+                        env_output.executed_actions
+                    )
                 if env_output.intervene_actions is not None:
                     self.rollout_results[stage_id].update_last_actions(
                         env_output.intervene_actions,

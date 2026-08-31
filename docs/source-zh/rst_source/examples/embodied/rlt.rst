@@ -3,7 +3,8 @@ RL Token：借助视觉-语言-动作模型启动在线强化学习
 
 **RL Token: Bootstrapping Online RL with Vision-Language-Action Models** 在冻结的 VLA 特征模型之上训练一个轻量级强化学习策略。在 RLinf 的配置和代码中，这套流程简称为 **RLT**。整个流程分为两个阶段：
 
-1. 在示范数据上联合训练 VLA 检查点和 RLT token transformer。
+1. 从任务可用的 VLA checkpoint 出发，在示范数据上训练 RLT token transformer；
+   仍可按需启用 VLA/RLT 联合训练。
 2. 冻结第一阶段得到的特征模型，用提取出的 RLT 状态训练一个轻量级 off-policy actor-critic。
 
 当前仓库中的示例配置面向 Franka peg insertion 和 ManiSkill
@@ -24,7 +25,7 @@ RLT 将表示学习和在线 RL 控制拆开。
    .. grid-item-card:: Stage 1
       :text-align: center
 
-      VLA SFT + RLT token transformer
+      冻结 VLA + RLT token transformer
 
    .. grid-item-card:: Stage 2
       :text-align: center
@@ -56,7 +57,7 @@ RLT 将表示学习和在线 RL 控制拆开。
      - 作用
    * - Franka Stage 1
      - ``examples/sft/config/realworld_rlt_stage1_sft_openpi_pi05.yaml``
-     - 在 Franka 示范数据上联合 SFT π₀.₅ 和 RLT token transformer。
+     - 冻结任务可用的 π₀.₅，只训练 RLT token transformer。
    * - Franka Stage 2
      - ``examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml``
      - 使用冻结的 Stage 1 特征模型，在真机上训练 RLT actor-critic。
@@ -117,7 +118,12 @@ RLT 如何工作
 Stage 1：学习 RLT 特征模型
 ~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Stage 1 从一个 VLA 检查点开始，在同一批示范数据上优化两个目标：
+Stage 1 同时支持联合训练和仅训练压缩器。真机配置假设 ``model_path`` 已经是任务可用、
+完成全参数微调的 π₀.₅ checkpoint，并启用 ``rlt_train_only``。此时 π₀.₅ 主干被冻结，
+prefix feature 在 ``torch.no_grad()`` 下提取，只优化 RLT token encoder/decoder，且不执行
+VLA action/flow-matching 分支。
+
+关闭 ``rlt_train_only`` 后仍可进行联合训练，并在同一批示范数据上优化两个目标：
 
 1. 普通 VLA 动作预测目标，日志中记为 ``vla_loss``。
 2. RLT token 目标，日志中记为 ``rlt_loss``。
@@ -150,13 +156,16 @@ Stage 1 中比较关键的字段：
          config_name: "pi05_franka_state"
          num_images_in_input: 1
          use_rlt: True
-         rlt_alpha: 1.0
+         rlt_train_only: True
+         rlt_alpha: 0.0
          rlt_prefix_seq_len: 1024
          rlt_image_only: False
          rlt_use_mask: True
 
 ``repo_id``、``config_name`` 和归一化统计需要与 Stage 2 特征模型配置保持一致。
 ``openpi_data`` 应写在 ``actor.model`` 下。
+仅设置 ``rlt_alpha: 0.0`` 不等于只训练压缩器；必须启用 ``rlt_train_only: True``，
+才能跳过 VLA action 分支并冻结其参数。
 
 .. note::
 
@@ -194,7 +203,17 @@ rollout 时：
 
 Franka 真机配置中，``keyboard_reward_wrapper: rlt_policy_switch`` 会提供
 ``rlt_switch_flags`` 标记。在操作员按下 ``b`` 之前，实际执行 VLA 的
-``ref_chunk``；按下 ``b`` 之后，实际执行 Stage 2 actor 的动作。
+``ref_chunk``，且不把 transition 写入 RLT replay buffer。按下 ``b`` 后，当前
+RLT segment 会锁存为关键阶段。若未启用 ``algorithm.rlt_schedule``，Stage 2 actor
+立即接管；若启用 schedule，则先在关键阶段继续执行 VLA reference action 并收集
+transition，直到 ``warmup_post_collect_updates`` 达标后 learner 才允许 actor 接管。
+
+同一个 wrapper 也提供稀疏标签。按 ``c`` 会产生 reward 1 和 terminal replay
+transition，但不会终止 Gym episode 或 reset 真机；wrapper 会清除
+``rlt_switch_flags``，因此下一份 observation 和 action chunk 会在当前物理位置交回
+VLA reference policy。按 ``a`` 或 ``q`` 会产生 reward 0 并终止 Gym episode，统一
+走现有 ``auto_reset`` 路径。未标注 step 的 reward 固定为 0，不再混合底层 TCP pose
+自动奖励。
 
 ManiSkill joint 配置中，``env.*.rlt_policy_switch`` 使用任务信息自动产生
 ``rlt_switch_flags``（actor/ref 阶段）和 ``intervene_flag``（expert 接管请求）。
@@ -333,6 +352,8 @@ Stage 1：训练 RLT 特征模型
        openpi:
          config_name: "pi05_franka_state"
          num_images_in_input: 1
+         use_rlt: True
+         rlt_train_only: True
          rlt_prefix_seq_len: 1024
 
 启动 SFT：
@@ -656,10 +677,11 @@ rollout worker 会返回 RLT 特征，learner 侧把这些特征组装成 transi
 
 这意味着：
 
-- 真机切换前的 step 仍然会用于训练。这些 step 的执行动作是 VLA reference action，transition 也会进入同一个 replay buffer。
-- 切换后的 step 执行 actor action，并以相同的 RLT observation 格式存储。
+- 真机进入关键阶段前的 step 会通过 ``record_transition=False`` 排除。
+- 关键阶段的 step 会进入 replay；learner warmup 期间实际动作仍是 VLA reference
+  action，learner ready 后则执行 Stage 2 actor action，除非被人工干预替换。
 - ManiSkill route 在整 chunk 级别选择 actor action 或 VLA ``ref_chunk``，replay 中的 ``action`` 始终是实际执行的动作。
-- ManiSkill learner 会把 rollout chunk 切成 1-sample transition trajectory，再放进 RLinf ``TrajectoryReplayBuffer``。
+- 真机和 ManiSkill learner 都会把 rollout chunk 切成 1-sample transition trajectory，再放进 RLinf ``TrajectoryReplayBuffer``。
 - ``sample_window_size`` 控制从 replay buffer 近期窗口中采样的范围，不需要和 ``max_steps_per_rollout_epoch`` 一致。
 - ``max_steps_per_rollout_epoch`` 控制一次 rollout flush 到训练侧之前收集多少环境 step。
 
@@ -684,15 +706,15 @@ rollout worker 会返回 RLT 特征，learner 侧把这些特征组装成 transi
   - ``env/success_once`` 和 ``env/episode_len``：任务结果指标。
   - ``eval/success_once``：固定 eval reset ids 上的成功率。
 
-  ManiSkill rollout / replay 诊断（由 actor 收到 trajectory 后统计）：
+  RLT rollout / replay 诊断（由 actor 收到 trajectory 后统计）：
 
   - ``train/replay/record_transition_rate``：收集到的 step 中被保存为 RLT transition 的比例（来自 ``forward_inputs.record_transition``）。
   - ``train/replay/actor_switch_rate``：收集到的 step 中实际由 actor/student action 控制环境的比例（来自 ``forward_inputs.actor_switch``）。
   - ``train/replay/intervention_requested_rate``：env 请求 expert 接管的比例（来自 ``forward_inputs.intervention_requested``）。
   - ``train/replay/intervention_rate``：route 实际应用 expert action 的比例（来自 ``trajectory.intervene_flags``）。
-  - ``train/replay/transition_count``、``train/replay/reward_mean``、``train/replay/reward_positive_rate``、``train/replay/done_rate``：当前 collect step 的 ManiSkill transition-replay 入库统计。
+  - ``train/replay/transition_count``、``train/replay/reward_mean``、``train/replay/reward_positive_rate``、``train/replay/done_rate``：当前 collect step 的 transition-replay 入库统计。
 
-  RLT schedule / learner backlog（ManiSkill ``algorithm.rlt_schedule.enable``）：
+  RLT schedule / learner backlog（启用 ``algorithm.rlt_schedule.enable`` 时）：
 
   - ``train/rlt/ready_for_online``：learner ``update_step`` 是否已超过 ``warmup_post_collect_updates``。
   - ``train/rlt/actor_updates_run``、``train/rlt/critic_updates_run`` 和 ``train/rlt/pending_update_budget``：本 step 执行的 actor/critic 更新次数，以及剩余 learner backlog。

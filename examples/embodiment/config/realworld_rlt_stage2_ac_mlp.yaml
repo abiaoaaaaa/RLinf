@@ -93,14 +93,16 @@ algorithm:
 
   replay_buffer:
     enable_cache: True
-    cache_size: 200
-    min_buffer_size: 2
-    sample_window_size: 200
+    cache_size: 500
+    # One replay row is one 10-step RLT action chunk. Wait for 100 distinct
+    # chunks before starting actor/critic updates instead of the smoke-test 2.
+    min_buffer_size: 100
+    sample_window_size: 500
     auto_save: False
 
   target_update_freq: 1
   target_update_type: all
-  train_actor_steps: 2
+  train_actor_steps: 100
   critic_actor_ratio: 4
   critic_subsample_size: 0
   backup_entropy: False

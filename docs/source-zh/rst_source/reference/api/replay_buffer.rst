@@ -99,8 +99,17 @@ Actor worker 从 Channel 接收 `Trajectory`，存入 `TrajectoryReplayBuffer`�
 - `pt`：`torch.save` 方式，默认格式
 - `pkl`：`pickle` 方式
 
-写盘在单线程 `ThreadPoolExecutor` 中异步执行，写完后再更新元数据与索引。
+写盘通过 `ThreadPoolExecutor` 异步执行，写完后再更新元数据与索引。
 这样可以降低训练过程中 I/O 对吞吐的影响。
+
+持久化自动恢复
+----------------------
+
+设置 ``auto_save=True`` 后，每次调用 ``add_trajectories`` 都会把 trajectory、
+metadata 和索引写入 ``auto_save_path``。后续进程可以对使用相同路径配置的 buffer
+调用 ``auto_resume()``：存在旧数据时加载并返回 ``True``，目录中尚无
+``metadata.json`` 时返回 ``False``。SAC 系列 actor 配置可设置
+``algorithm.replay_buffer.auto_resume: True``，在 worker 初始化时自动执行该检查。
 
 检查点与分布式加载
 ----------------------
@@ -118,4 +127,6 @@ Actor worker 从 Channel 接收 `Trajectory`，存入 `TrajectoryReplayBuffer`�
 
 - **长轨迹场景**：优先使用窗口采样，减少旧数据干扰。
 - **高并发训练**：启用缓存提升采样吞吐，避免频繁读盘。
+- **跨重启保留采集数据**：在 actor replay-buffer 配置中同时设置
+  `auto_save=True`、固定的 `auto_save_path` 和 `auto_resume=True`。
 - **无持久化需求**：可设置 `auto_save=False`，保存 checkpoint 时会把缓存轨迹与 metadata 一并写入保存路径。

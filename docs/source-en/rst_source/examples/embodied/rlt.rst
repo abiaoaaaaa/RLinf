@@ -6,8 +6,8 @@ a compact reinforcement-learning policy on top of a frozen VLA feature model.
 In RLinf configs and code, this workflow is abbreviated as **RLT**. It has two
 stages:
 
-1. Train a VLA checkpoint together with an RLT token transformer on
-   demonstration data.
+1. Starting from a task-ready VLA checkpoint, train an RLT token transformer
+   on demonstration data. Joint VLA/RLT training remains optional.
 2. Freeze that feature model and train a lightweight off-policy actor-critic
    policy using the extracted RLT state.
 
@@ -30,7 +30,7 @@ RLT separates representation learning from online RL control.
    .. grid-item-card:: Stage 1
       :text-align: center
 
-      VLA SFT + RLT token transformer
+      Frozen VLA + RLT token transformer
 
    .. grid-item-card:: Stage 2
       :text-align: center
@@ -64,7 +64,7 @@ Provided Configuration Files
      - Purpose
    * - Franka Stage 1
      - ``examples/sft/config/realworld_rlt_stage1_sft_openpi_pi05.yaml``
-     - SFT π₀.₅ together with the RLT token transformer on Franka demonstrations.
+     - Freeze a task-ready π₀.₅ and train only the RLT token transformer.
    * - Franka Stage 2
      - ``examples/embodiment/config/realworld_rlt_stage2_ac_mlp.yaml``
      - Run real-world RLT actor-critic training with the frozen Stage 1 feature model.
@@ -125,8 +125,15 @@ How RLT Works
 Stage 1: Learn the RLT Feature Model
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Stage 1 starts from a VLA checkpoint and optimizes two objectives from the
-same demonstration batch:
+Stage 1 supports joint VLA/RLT training and compressor-only training. The
+real-world configuration assumes that ``model_path`` is already a task-ready,
+fully fine-tuned π₀.₅ checkpoint and enables ``rlt_train_only``. In this mode,
+the π₀.₅ backbone is frozen, prefix features are extracted under
+``torch.no_grad()``, and only the RLT token encoder/decoder is optimized. The
+VLA action/flow-matching branch is not executed.
+
+Joint training remains available by disabling ``rlt_train_only``. It optimizes
+two objectives from the same demonstration batch:
 
 1. The normal VLA action objective, reported as ``vla_loss``.
 2. The RLT token objective, reported as ``rlt_loss``.
@@ -162,13 +169,17 @@ Important Stage 1 fields:
          config_name: "pi05_franka_state"
          num_images_in_input: 1
          use_rlt: True
-         rlt_alpha: 1.0
+         rlt_train_only: True
+         rlt_alpha: 0.0
          rlt_prefix_seq_len: 1024
          rlt_image_only: False
          rlt_use_mask: True
 
 Keep ``repo_id``, ``config_name``, and normalization stats consistent with the
 Stage 2 feature-model config. ``openpi_data`` belongs under ``actor.model``.
+Setting only ``rlt_alpha: 0.0`` is not equivalent to compressor-only training;
+``rlt_train_only: True`` is what skips the VLA action branch and freezes its
+parameters.
 
 .. note::
 
@@ -209,8 +220,20 @@ During rollout:
 
 For the provided real-robot config, ``keyboard_reward_wrapper:
 rlt_policy_switch`` adds an ``rlt_switch_flags`` flag. Before the operator presses
-``b``, the executed action is the VLA ``ref_chunk``; after ``b`` is pressed,
-the executed action switches to the Stage 2 actor.
+``b``, the executed action is the VLA ``ref_chunk`` and the transition is not
+stored in the RLT replay buffer. Pressing ``b`` latches the critical phase for
+the current RLT segment. If ``algorithm.rlt_schedule`` is disabled, the Stage 2
+actor takes control immediately. If it is enabled, critical-phase transitions
+are first collected under the VLA reference policy until
+``warmup_post_collect_updates`` makes the learner ready.
+
+The same wrapper supplies sparse labels. Pressing ``c`` emits reward 1 and a
+terminal replay transition, but does not terminate the Gym episode or reset the
+robot. It clears ``rlt_switch_flags``, so the next observation and action chunk
+are routed to the VLA reference policy at the current physical state. Pressing
+``a`` or ``q`` emits reward 0 and terminates the Gym episode, which uses the
+existing ``auto_reset`` path. Unlabelled steps return reward 0; the wrapper does
+not mix in the underlying TCP-pose reward.
 
 For the ManiSkill joint config, ``env.*.rlt_policy_switch`` automatically
 produces ``rlt_switch_flags`` (actor/ref phase) and ``intervene_flag`` (expert
@@ -357,6 +380,8 @@ Edit the Stage 1 config paths before launch:
        openpi:
          config_name: "pi05_franka_state"
          num_images_in_input: 1
+         use_rlt: True
+         rlt_train_only: True
          rlt_prefix_seq_len: 1024
 
 Launch SFT:
@@ -692,14 +717,14 @@ learner side stores those features as transitions:
 
 This means:
 
-- Steps before a real-robot policy switch are still useful. Their executed
-  action is the VLA reference action, and their transition is stored in the
-  same replay buffer.
-- Steps after the switch use the actor action and are also stored with the
-  same RLT observation format.
+- Real-robot steps before the critical-phase switch are excluded by
+  ``record_transition=False``.
+- Critical-phase steps are stored even during learner warmup, when the executed
+  action is still the VLA reference action. Once the learner is ready, stored
+  steps use the Stage 2 actor action unless intervention replaces it.
 - The ManiSkill route chooses actor actions or the VLA ``ref_chunk`` at whole
   chunk granularity. The replay ``action`` is always the executed action.
-- The ManiSkill learner splits rollout chunks into 1-sample transition
+- Both real-robot and ManiSkill learners split rollout chunks into 1-sample transition
   trajectories before adding them to RLinf ``TrajectoryReplayBuffer``.
 - ``sample_window_size`` controls the recent transition window sampled from the
   replay buffer. It does not need to match ``max_steps_per_rollout_epoch``.
@@ -728,15 +753,15 @@ Useful RLT signals:
   - ``env/success_once`` and ``env/episode_len``: task outcome metrics.
   - ``eval/success_once``: success rate on fixed eval reset ids.
 
-  ManiSkill rollout / replay diagnostics (logged from trajectories received by the actor):
+  RLT rollout / replay diagnostics (logged from trajectories received by the actor):
 
   - ``train/replay/record_transition_rate``: fraction of collected steps saved as RLT transitions (from ``forward_inputs.record_transition``).
   - ``train/replay/actor_switch_rate``: fraction of collected steps where the actor/student action actually controlled the env (from ``forward_inputs.actor_switch``).
   - ``train/replay/intervention_requested_rate``: fraction of steps where the env requested expert takeover (from ``forward_inputs.intervention_requested``).
   - ``train/replay/intervention_rate``: fraction of steps where the route actually applied expert actions (from ``trajectory.intervene_flags``).
-  - ``train/replay/transition_count``, ``train/replay/reward_mean``, ``train/replay/reward_positive_rate``, ``train/replay/done_rate``: ManiSkill transition-replay ingest stats for the current collect step.
+  - ``train/replay/transition_count``, ``train/replay/reward_mean``, ``train/replay/reward_positive_rate``, ``train/replay/done_rate``: transition-replay ingest stats for the current collect step.
 
-  RLT schedule / learner backlog (ManiSkill ``algorithm.rlt_schedule.enable``):
+  RLT schedule / learner backlog (when ``algorithm.rlt_schedule.enable`` is set):
 
   - ``train/rlt/ready_for_online``: whether learner ``update_step`` has passed ``warmup_post_collect_updates``.
   - ``train/rlt/actor_updates_run``, ``train/rlt/critic_updates_run``, and ``train/rlt/pending_update_budget``: actor/critic updates executed in the step and remaining learner backlog.

@@ -23,7 +23,12 @@ from rlinf.envs.realworld.common.keyboard.keyboard_listener import KeyboardListe
 
 
 class KeyboardRLTPolicySwitchWrapper(gym.Wrapper):
-    """Press ``b`` to enter the RLT critical phase."""
+    """Control the RLT phase and sparse terminal reward from the keyboard.
+
+    ``b`` enters the RLT critical phase. ``c`` ends that phase with reward 1
+    and returns control to the VLA without resetting. ``a``/``q`` terminate
+    the robot episode with reward 0 so the existing auto-reset path can run.
+    """
 
     PEDAL_DEBOUNCE_S = 0.2
 
@@ -46,7 +51,10 @@ class KeyboardRLTPolicySwitchWrapper(gym.Wrapper):
     def step(
         self, action: ActType
     ) -> tuple[ObsType, SupportsFloat, bool, bool, dict[str, Any]]:
-        obs, reward, terminated, truncated, info = self.env.step(action)
+        obs, _, _, truncated, info = self.env.step(action)
+        reward = 0.0
+        terminated = False
+        rlt_segment_done = False
 
         event: str | None = None
         for key in self.listener.pop_pressed_keys():
@@ -60,12 +68,29 @@ class KeyboardRLTPolicySwitchWrapper(gym.Wrapper):
                     event = "enter_actor"
                     self._rlt_switch_flags = True
                     self._log_info(
-                        "Pedal 'b' pressed; switching RLT rollout to Stage2 actor."
+                        "Pedal 'b' pressed; entering the RLT critical phase."
                     )
                 else:
                     event = "actor_already_active"
+            elif key == "c":
+                event = "success"
+                reward = 1.0
+                rlt_segment_done = True
+                self._rlt_switch_flags = False
+                self._log_info("Key 'c' pressed; RLT segment succeeded.")
+                break
+            elif key in {"a", "q"}:
+                event = "failure" if key == "a" else "abort"
+                reward = 0.0
+                terminated = True
+                self._rlt_switch_flags = False
+                self._log_info(
+                    f"Key '{key}' pressed; terminating the episode with reward 0."
+                )
+                break
 
         info["rlt_switch_flags"] = self._rlt_switch_flags
+        info["rlt_segment_done"] = rlt_segment_done
         info["rlt_policy_switch_event"] = event
         return obs, reward, terminated, truncated, info
 

@@ -68,32 +68,6 @@ def _flatten_action_chunk(actions: torch.Tensor) -> torch.Tensor:
     return actions.reshape(actions.shape[0], -1)
 
 
-def _normalize_rlt_switch_flags(
-    actions: torch.Tensor,
-    rlt_switch_flags: torch.Tensor | None,
-    *,
-    default: bool,
-) -> torch.Tensor:
-    if rlt_switch_flags is None:
-        rlt_switch_flags = torch.full(
-            (actions.shape[0], actions.shape[1]),
-            bool(default),
-            dtype=torch.bool,
-            device=actions.device,
-        )
-    else:
-        rlt_switch_flags = torch.as_tensor(
-            rlt_switch_flags, device=actions.device
-        ).bool()
-    if rlt_switch_flags.dim() == 1:
-        rlt_switch_flags = rlt_switch_flags[:, None]
-    if rlt_switch_flags.shape[1] > 1:
-        rlt_switch_flags = rlt_switch_flags[:, -1:]
-    if actions.shape[1] > 1:
-        rlt_switch_flags = rlt_switch_flags.expand(-1, actions.shape[1])
-    return rlt_switch_flags.reshape(actions.shape[0], actions.shape[1], 1)
-
-
 def _base_ref_actions(
     ref_chunk: torch.Tensor,
     *,
@@ -107,6 +81,73 @@ def _base_ref_actions(
     return ref_chunk[:, :chunk_len, :action_dim].to(device=device, dtype=dtype)
 
 
+def project_actions_to_reference(
+    actions: torch.Tensor,
+    ref_actions: torch.Tensor,
+    max_delta: float | list[float] | tuple[float, ...] | None,
+    constrained_steps: int | None = None,
+    action_space: str | None = None,
+) -> torch.Tensor:
+    """Project full policy actions into a box around reference actions.
+
+    Args:
+        actions: Full action candidates shaped ``[..., action_dim]``.
+        ref_actions: Reference actions with the same shape as ``actions``.
+        max_delta: Non-negative normalized delta per action dimension, or one
+            scalar shared by all dimensions. ``None`` disables projection.
+        constrained_steps: Number of leading chunk steps to project. ``None``
+            projects the complete chunk.
+
+    Returns:
+        Actions bounded around the reference and inside ``[-1, 1]``.
+    """
+    if max_delta is None:
+        projected = actions
+    else:
+        projected = None
+    if constrained_steps is not None and constrained_steps < 0:
+        raise ValueError("RLT constrained_steps must be non-negative or None")
+    if max_delta is None:
+        delta = None
+    else:
+        delta = torch.as_tensor(max_delta, device=actions.device, dtype=actions.dtype)
+    if delta is not None and delta.numel() == 1:
+        delta = delta.expand(actions.shape[-1])
+    if delta is not None and delta.numel() != actions.shape[-1]:
+        raise ValueError(
+            "RLT actor reference limit must be scalar or match action_dim, got "
+            f"{delta.numel()} values for action_dim={actions.shape[-1]}."
+        )
+    if delta is not None and (delta < 0).any():
+        raise ValueError("RLT actor reference limits must be non-negative")
+    steps = (
+        actions.shape[-2]
+        if constrained_steps is None
+        else min(constrained_steps, actions.shape[-2])
+    )
+    if steps == 0:
+        projected = actions
+    elif delta is not None:
+        projected_prefix = torch.maximum(
+            torch.minimum(actions[..., :steps, :], ref_actions[..., :steps, :] + delta),
+            ref_actions[..., :steps, :] - delta,
+        ).clamp(-1.0, 1.0)
+        projected = (
+            projected_prefix
+            if steps == actions.shape[-2]
+            else torch.cat((projected_prefix, actions[..., steps:, :]), dim=-2)
+        )
+    if action_space == "eef":
+        if projected.shape[-1] != 20:
+            raise ValueError("EEF reference projection requires action_dim=20")
+        from rlinf.envs.realworld.zadai.action_codec import canonicalize_rot6d
+
+        projected = projected.clone()
+        projected[..., 3:9] = canonicalize_rot6d(projected[..., 3:9])
+        projected[..., 13:19] = canonicalize_rot6d(projected[..., 13:19])
+    return projected
+
+
 class RLTRoute(ABC):
     @abstractmethod
     def route(self, ctx: RLTRouteContext) -> RLTRouteOutput:
@@ -116,31 +157,58 @@ class RLTRoute(ABC):
 class RealworldRLTRoute(RLTRoute):
     """Actor/ref routing for realworld RLT (keyboard or env switch flags)."""
 
+    def __init__(
+        self,
+        *,
+        use_schedule: bool,
+        warmup_updates: int,
+        actor_reference_max_delta: float | list[float] | None = None,
+        actor_reference_constrained_steps: int | None = None,
+        actor_action_space: str | None = None,
+    ):
+        self.use_schedule = use_schedule
+        self.warmup_updates = warmup_updates
+        self.actor_reference_max_delta = actor_reference_max_delta
+        self.actor_reference_constrained_steps = actor_reference_constrained_steps
+        self.actor_action_space = actor_action_space
+
+    def _ready_for_online(self, version: int) -> bool:
+        return not self.use_schedule or int(version) >= self.warmup_updates
+
     def route(self, ctx: RLTRouteContext) -> RLTRouteOutput:
         actions = ctx.student_actions
         result = ctx.result
-        rlt_switch_flags = _normalize_rlt_switch_flags(
-            actions,
+        critical_phase = _last_info_bool(
             ctx.rlt_switch_flags,
+            batch_size=actions.shape[0],
+            device=actions.device,
             default=ctx.default_actor_switch,
         )
+        learner_ready = torch.full_like(
+            critical_phase,
+            self._ready_for_online(ctx.version),
+        )
+        actor_switch = critical_phase & learner_ready
         ref_actions = result["forward_inputs"]["ref_chunk"].to(
             device=actions.device, dtype=actions.dtype
         )
-        routed_actions = torch.where(
-            rlt_switch_flags,
+        constrained_actor_actions = project_actions_to_reference(
             actions,
+            ref_actions[:, : actions.shape[1], : actions.shape[2]],
+            self.actor_reference_max_delta,
+            self.actor_reference_constrained_steps,
+            self.actor_action_space,
+        )
+        routed_actions = torch.where(
+            actor_switch[:, None, None],
+            constrained_actor_actions,
             ref_actions[:, : actions.shape[1], : actions.shape[2]],
         ).contiguous()
         result["forward_inputs"]["action"] = routed_actions.reshape(
             routed_actions.shape[0], -1
         ).contiguous()
-        result["forward_inputs"]["record_transition"] = rlt_switch_flags.reshape(
-            actions.shape[0], -1
-        )[:, :1].to(torch.bool)
-        result["forward_inputs"]["actor_switch"] = result["forward_inputs"][
-            "record_transition"
-        ]
+        result["forward_inputs"]["record_transition"] = critical_phase[:, None]
+        result["forward_inputs"]["actor_switch"] = actor_switch[:, None]
         return RLTRouteOutput(actions=routed_actions, result=result)
 
 
@@ -237,10 +305,21 @@ class SimulatorRLTRoute(RLTRoute):
 
 
 def build_rlt_route(cfg: Any) -> RLTRoute:
+    schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
+    route_kwargs = {
+        "use_schedule": bool(schedule_cfg.get("enable", False)),
+        "warmup_updates": int(schedule_cfg.get("warmup_post_collect_updates", 0)),
+    }
     if use_simulator_transition_replay(cfg):
-        schedule_cfg = cfg.algorithm.get("rlt_schedule", {}) or {}
-        return SimulatorRLTRoute(
-            use_schedule=bool(schedule_cfg.get("enable", False)),
-            warmup_updates=int(schedule_cfg.get("warmup_post_collect_updates", 0)),
-        )
-    return RealworldRLTRoute()
+        return SimulatorRLTRoute(**route_kwargs)
+    constraint_cfg = cfg.algorithm.get("actor_action_constraint", {}) or {}
+    route_kwargs["actor_reference_max_delta"] = (
+        constraint_cfg.get("max_reference_delta")
+        if bool(constraint_cfg.get("enable", False))
+        else None
+    )
+    route_kwargs["actor_reference_constrained_steps"] = constraint_cfg.get(
+        "constrained_steps"
+    )
+    route_kwargs["actor_action_space"] = constraint_cfg.get("action_space")
+    return RealworldRLTRoute(**route_kwargs)

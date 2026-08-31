@@ -190,6 +190,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
                 "trajectory_format", "pt"
             ),
         )
+        if self.cfg.algorithm.replay_buffer.get("auto_resume", False):
+            self.replay_buffer.auto_resume()
 
         min_demo_buffer_size = 0
         if self.cfg.algorithm.get("demo_buffer", None) is not None:
@@ -844,4 +846,12 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         buffer_load_path = os.path.join(
             load_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
         )
-        self.replay_buffer.load_checkpoint(buffer_load_path)
+        # Keep the independently persisted replay when auto-resume already
+        # restored a newer buffer before the full Stage 2 checkpoint loads.
+        # Otherwise an older checkpoint snapshot could silently roll replay
+        # data back (e.g. 381 samples replacing a 454-sample auto-resume).
+        if not (
+            self.cfg.algorithm.replay_buffer.get("auto_resume", False)
+            and self.replay_buffer.total_samples > 0
+        ):
+            self.replay_buffer.load_checkpoint(buffer_load_path)

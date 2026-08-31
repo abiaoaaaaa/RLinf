@@ -1118,6 +1118,29 @@ class TrajectoryReplayBuffer:
                         flat_trajectory,
                     )
 
+    def auto_resume(self) -> bool:
+        """Load previously auto-saved trajectories from this buffer's path.
+
+        Returns:
+            ``True`` when existing metadata was loaded, otherwise ``False``.
+
+        Raises:
+            RuntimeError: If automatic persistence is not enabled.
+        """
+        if not self.auto_save or self.auto_save_path is None:
+            raise RuntimeError("auto_resume requires auto_save=True")
+        metadata_path = self._get_metadata_path(self.auto_save_path)
+        if not os.path.isfile(metadata_path):
+            return False
+        self.load_checkpoint(self.auto_save_path)
+        self.logger.info(
+            "Resumed replay buffer from %s with %d trajectories and %d samples",
+            self.auto_save_path,
+            self.size,
+            self._total_samples,
+        )
+        return True
+
     def clear_cache(self):
         """Clear trajectory cache."""
         self.close()

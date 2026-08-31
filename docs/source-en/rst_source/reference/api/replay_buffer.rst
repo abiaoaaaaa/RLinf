@@ -109,8 +109,19 @@ Supported formats:
 - `pt`: default `torch.save`
 - `pkl`: `pickle`
 
-Trajectories are written asynchronously via a single-thread `ThreadPoolExecutor`.
+Trajectories are written asynchronously via a `ThreadPoolExecutor`.
 Metadata and indices are updated after writes complete to reduce I/O stalls.
+
+Persistent Auto-Resume
+----------------------
+
+With ``auto_save=True``, each call to ``add_trajectories`` queues trajectory,
+metadata, and index writes under ``auto_save_path``. A later process can call
+``auto_resume()`` on a buffer configured with the same path. The method returns
+``True`` after loading existing state, or ``False`` when the directory does not
+yet contain ``metadata.json``. SAC-family actor configs can set
+``algorithm.replay_buffer.auto_resume: True`` to perform this check during
+worker initialization.
 
 Checkpoint and Distributed Loading
 ----------------------------------
@@ -128,5 +139,7 @@ Usage Tips
 
 - **Long trajectories**: prefer windowed sampling to reduce stale data.
 - **High concurrency**: enable cache to improve sampling throughput.
+- **Restart-safe collection**: combine `auto_save=True`, a stable
+  `auto_save_path`, and `auto_resume=True` in the actor replay-buffer config.
 - **No persistence needed**: set `auto_save=False`; cached trajectories and metadata
   are saved into the checkpoint path when `save_checkpoint` is called.

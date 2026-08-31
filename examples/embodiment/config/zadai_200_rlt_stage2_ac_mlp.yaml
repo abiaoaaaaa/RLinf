@@ -1,0 +1,220 @@
+defaults:
+  - env/zadai_200_http@env.train
+  - env/zadai_200_http@env.eval
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+  - _self_
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: {node_group: "4090", placement: 0}
+    env: {node_group: "4090", placement: 0}
+    rollout: {node_group: "4090", placement: 0}
+  node_groups:
+    - label: "4090"
+      node_ranks: 0
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: "../results"
+    project_name: rlinf-rlt
+    experiment_name: "zadai_200_rlt_stage2_ac_mlp"
+    logger_backends: ["tensorboard"]
+  max_epochs: 8000
+  max_steps: -1
+  only_eval: False
+  val_check_interval: -1
+  # One outer rollout is configured for at most 300 low-level steps.  At
+  # 30 Hz, 30 outer iterations are an initial ~5 minute checkpoint cadence;
+  # this is step-based, not a strict wall-clock timer.
+  save_interval: 30
+  resume_dir: null
+  ckpt_path: null
+
+algorithm:
+  update_epoch: 8
+  group_size: 1
+  agg_q: min
+  actor_agg_q: q1
+  enable_drq: False
+  q_head_type: ${actor.model.q_head_type}
+  adv_type: embodied_sac
+  loss_type: rlt_ac
+  loss_agg_func: token-mean
+  q_weight: 0.1
+  bc_weight: 5.0
+  reference_dropout_prob: 0.5
+  # The Stage 2 actor still predicts a complete action chunk, but deployment
+  # and Q-policy queries project its first action near OpenPI at handoff.
+  # 0.02 normalized is about 0.063 rad for the 14 [-pi, pi] joints. Keep both
+  # grippers exactly on the OpenPI reference while they are not teleoperated.
+  actor_action_constraint:
+    enable: True
+    action_space: joint
+    # Only constrain the handoff action. Steps 2-30 are governed by the
+    # physical per-step and whole-chunk limits in the Zadai environment.
+    constrained_steps: 1
+    max_reference_delta: [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
+                          0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
+                          0.0, 0.0]
+  bootstrap_type: standard
+  gamma: 0.96
+  tau: 0.005
+  entropy_tuning:
+    alpha_type: fixed_alpha
+    initial_alpha: 0.0
+    optim:
+      lr: 3.0e-4
+      lr_scheduler: torch_constant
+      clip_grad: 10.0
+  replay_buffer:
+    enable_cache: True
+    cache_size: 500
+    min_buffer_size: 100
+    sample_window_size: 500
+    # Persist every collected transition asynchronously and reuse it on the
+    # next launch. The actor worker appends rank_0 below this base directory.
+    auto_save: True
+    auto_resume: True
+    auto_save_path: ${oc.env:ZADAI_REPLAY_BUFFER_PATH,/home/zzx23457/code_xlb/RLinf/replay_buffers/zadai_200_rlt_stage2}
+  # Keep a fixed offline anchor while the replay buffer receives new online
+  # transitions. ReplayBufferDataset samples half of every training batch from
+  # this buffer and half from replay_buffer. The path must name a persisted
+  # TrajectoryReplayBuffer rank directory (metadata.json + trajectory_*.pt),
+  # not a LeRobot/Stage 1 demonstration dataset.
+  #
+  # By default, initialize it from the verified 30-step Stage 2 replay
+  # snapshot. At startup it is loaded into memory once, so subsequent writes to
+  # replay_buffer do not change the offline half of the batch. Override this
+  # path with ZADAI_DEMO_BUFFER_PATH after preparing a dedicated RLT demo
+  # buffer with the same z_rl/proprio/ref_chunk/action schema.
+  demo_buffer:
+    enable_cache: True
+    cache_size: 500
+    min_buffer_size: 1
+    sample_window_size: 500
+    load_path: ${oc.env:ZADAI_DEMO_BUFFER_PATH,/home/zzx23457/code_xlb/RLinf/replay_buffers/zadai_200_rlt_stage2/rank_0}
+    auto_save: False
+  target_update_freq: 1
+  target_update_type: all
+  train_actor_steps: 100
+  critic_actor_ratio: 4
+  critic_subsample_size: 0
+  backup_entropy: False
+  # Do not let the randomly initialized RLT actor control the robot until a
+  # small real-world replay warmup has been collected and trained on.
+  rlt_schedule:
+    enable: True
+    # One real-world replay transition represents a full 30-step action chunk.
+    # Collect 250 keyboard-selected critical chunks before the first RLT update.
+    warmup_min_size: 250
+    # Keep the randomly initialized RLT head on the reference policy until it
+    # has completed 100 replay updates (five outer steps at the cap below).
+    warmup_post_collect_updates: 100
+    # Match the original RLinf real-world cadence after warmup: train once on
+    # every runner global step, even if that rollout added no critical data.
+    train_every_runner_step: True
+    train_every_episodes: 0
+    train_every_transitions: 0
+    max_updates_per_train_step: 20
+
+env:
+  group_name: EnvGroup
+  train:
+    rollout_epoch: 1
+    max_steps_per_rollout_epoch: 300
+  eval:
+    rollout_epoch: 1
+    max_steps_per_rollout_epoch: 100
+    video_cfg:
+      save_video: False
+
+rollout:
+  group_name: RolloutGroup
+  generation_backend: huggingface
+  enable_offload: False
+  pipeline_stage_num: 1
+  collect_transitions: True
+  collect_prev_infos: False
+  model:
+    model_path: null
+    precision: ${actor.model.precision}
+    action_dim: ${actor.model.action_dim}
+    num_action_chunks: ${actor.model.num_action_chunks}
+    ref_num_action_chunks: ${actor.model.ref_num_action_chunks}
+  rlt_feature_model:
+    model_type: openpi
+    precision: null
+    is_lora: False
+    model_path: ${oc.env:ZADAI_STAGE1_CHECKPOINT,/home/zzx23457/code_xlb/RLinf/logs/20260825-23:18:34-zadai_200_rlt_stage1_sft_openpi_pi05/zadai_200_rlt_stage1/checkpoints/global_step_7000/actor}
+    openpi_data:
+      repo_id: zadai_200
+      norm_stats_path: ${oc.env:ZADAI_NORM_STATS_PATH,/home/zzx23457/pi05_zadai_200_rlt_weight_data_20260825/model/checkpoint_149999/assets/zadai_200/norm_stats.json}
+    openpi:
+      config_name: pi05_hhw_tj_zadai_200_uniform
+      num_images_in_input: 3
+      action_chunk: ${actor.model.ref_num_action_chunks}
+      action_env_dim: 16
+      # Match native OpenPI pi0.5 inference (sample_actions default: 10).
+      num_steps: 10
+      state_indices: []
+      rlt_action_space: joint
+      noise_method: flow_noise
+      noise_params: [0.16, 0.12, 200]
+      joint_logprob: True
+      use_rlt: True
+      rlt_prefix_seq_len: 1024
+      rlt_image_only: False
+      rlt_use_mask: True
+  enable_torch_compile: True
+  enable_cuda_graph: False
+
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 64
+  global_batch_size: 64
+  seed: 1234
+  enable_offload: False
+  model:
+    model_type: rlt_mlp_policy
+    precision: fp32
+    add_value_head: False
+    add_q_head: True
+    q_head_type: default
+    fixed_std: 0.002
+    is_lora: False
+    z_dim: 2048
+    proprio_dim: 16
+    # RLT action space is normalized to [-1, 1]; ZadaiEnv converts to
+    # physical absolute joints/ranges before calling VLAHost.
+    action_dim: 16
+    # Execute 30 low-level controls before the next observation/inference.
+    # The actor predicts a complete chunk; only its first action is constrained
+    # near OpenPI, while the physical env limits the complete 30-step chunk.
+    num_action_chunks: 30
+    ref_num_action_chunks: 30
+  optim:
+    clip_grad: 10.0
+    lr: 3.0e-4
+    lr_scheduler: torch_constant
+  critic_optim:
+    clip_grad: 10.0
+    lr: 3.0e-4
+    lr_scheduler: torch_constant
+  fsdp_config:
+    strategy: fsdp
+    sharding_strategy: no_shard
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: ${actor.model.precision}
+
+reward:
+  use_reward_model: False
+
+critic:
+  use_critic_model: False

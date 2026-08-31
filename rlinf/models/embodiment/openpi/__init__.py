@@ -88,6 +88,12 @@ def get_model(cfg: DictConfig, torch_dtype=None):
         model.load_state_dict(all_state_dict, strict=False)
 
     model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+    if actor_model_config.rlt_train_only:
+        trainable_params = model.freeze_for_rlt_stage1()
+        model.logger.info(
+            "RLT Stage1 compressor-only mode: froze the OpenPI backbone; "
+            f"{trainable_params:,} rlt_module parameters remain trainable"
+        )
     # fsdp replace
     # model.paligemma_with_expert.replace_gemma_decoder_layers()
     # load data stats

@@ -101,6 +101,7 @@ class OpenPi0Config(Pi0Config):
 
     # ===== RLT SFT parameters =====
     use_rlt: bool = False
+    rlt_train_only: bool = False
     rlt_alpha: float = 1.0
     rlt_input_dim: int = 2048
     rlt_embed_dim: int = 2048
@@ -112,6 +113,9 @@ class OpenPi0Config(Pi0Config):
     rlt_image_only: bool = True
     rlt_use_mask: bool = False
     state_indices: list[int] | None = None
+    # Optional physical-action codec at the Stage1-reference/Stage2 boundary.
+    # Dataset and OpenPI output remain physical absolute targets.
+    rlt_action_space: str | None = None
 
 
 class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
@@ -396,6 +400,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             ),
             observation,
         )
+
+        if self.config.rlt_train_only:
+            if not self.config.use_rlt:
+                raise ValueError("rlt_train_only requires use_rlt=True.")
+            return self._rlt_only_sft_forward(observation)
+
         if not isinstance(actions, torch.Tensor):
             actions = torch.as_tensor(actions, device=device)
         else:
@@ -425,6 +435,31 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "vla_loss": vla_loss,
             "rlt_loss": rlt_loss,
         }
+
+    def _rlt_only_sft_forward(self, observation):
+        """Train the RLT compressor while keeping the pretrained VLA frozen."""
+        self.paligemma_with_expert.eval()
+        prefix_output, prefix_mask = self._extract_rlt_prefix_embeddings(
+            observation, train=False
+        )
+        rlt_param = next(self.rlt_module.parameters())
+        prefix_output = prefix_output.to(device=rlt_param.device, dtype=rlt_param.dtype)
+        rlt_mask = prefix_mask if self.config.rlt_use_mask else None
+        rlt_loss, _ = self.rlt_module(prefix_output, rlt_mask)
+        return {"loss": rlt_loss, "rlt_loss": rlt_loss}
+
+    def freeze_for_rlt_stage1(self) -> int:
+        """Freeze the VLA and leave only the RLT compressor trainable."""
+        if not self.config.use_rlt or not hasattr(self, "rlt_module"):
+            raise ValueError("rlt_train_only requires use_rlt=True.")
+
+        from rlinf.models.embodiment.modules.rlt_token_transformer import (
+            freeze_non_rlt_parameters,
+        )
+
+        trainable_params = freeze_non_rlt_parameters(self, self.rlt_module)
+        self.paligemma_with_expert.eval()
+        return trainable_params
 
     def _sft_forward_with_rlt_prefix(self, observation, actions):
         images, img_masks, lang_tokens, lang_masks, state = (
@@ -592,6 +627,16 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         ref_chunk = self.output_transform(
             {"actions": outputs["actions"], "state": observation.state}
         )["actions"]
+        config_name = str(self.config.config_name).lower()
+        rlt_action_space = self.config.rlt_action_space
+        if rlt_action_space is None and "zadai" in config_name:
+            # Compatibility for checkpoints/configs created before the field
+            # was explicit. New configs should always set rlt_action_space.
+            rlt_action_space = "eef" if "eef" in config_name else "joint"
+        if rlt_action_space in {"joint", "eef"}:
+            from rlinf.envs.realworld.zadai.action_codec import absolute_to_policy
+
+            ref_chunk = absolute_to_policy(ref_chunk, rlt_action_space)
         raw_proprio = self._select_configured_state(env_obs["states"])
         if (
             isinstance(self.config.config_name, str)
@@ -803,6 +848,19 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
 
     def obs_processor(self, env_obs):
         env_states = self._select_configured_state(env_obs["states"])
+        if "zadai" in str(self.config.config_name).lower():
+            extra_images = env_obs.get("extra_view_images")
+            if extra_images is None or extra_images.shape[1] < 2:
+                raise ValueError(
+                    "Zadai OpenPI inference requires two extra views: wrist_L and wrist_R."
+                )
+            return {
+                "observation/top": env_obs["main_images"],
+                "observation/wrist_L": extra_images[:, 0],
+                "observation/wrist_R": extra_images[:, 1],
+                "observation/state": env_states,
+                "prompt": env_obs["task_descriptions"],
+            }
         processed_obs = {
             "observation/image": env_obs["main_images"],
             "prompt": env_obs["task_descriptions"],

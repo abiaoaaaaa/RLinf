@@ -1,0 +1,68 @@
+env_type: realworld
+
+total_num_envs: 1
+auto_reset: True
+ignore_terminations: False
+reward_mode: raw
+wrap_obs_mode: simple
+seed: 0
+group_size: 1
+use_fixed_reset_state_ids: False
+max_steps_per_rollout_epoch: 300
+# The demonstrations run at 30 Hz. Allow up to five minutes per robot episode,
+# while keeping each runner collection epoch at 300 steps for regular metrics
+# and training scheduling.
+max_episode_steps: 9000
+main_image_key: top
+keyboard_reward_wrapper: rlt_policy_switch
+use_spacemouse: False
+use_gello: False
+use_pico: False
+no_gripper: False
+
+video_cfg:
+  save_video: False
+  info_on_video: True
+  video_base_dir: ${runner.logger.log_path}/video/train
+
+init_params:
+  id: "Zadai200Env-v1"
+  num_envs: null
+
+override_cfg:
+  server_url: ${oc.env:ZADAI_VLAHOST_URL,http://127.0.0.1:8010}
+  # POST /go_home waits about 5 s while VLAHost hands control to the planner.
+  # Keep this above that server-side synchronization window.
+  timeout: ${oc.decode:${oc.env:ZADAI_HTTP_TIMEOUT,10.0}}
+  # VLAHost plays absolute waypoints at this rate; /state remains sampled per step.
+  step_frequency: 30.0
+  action_mode: absolute
+  # Submit each 30-step policy output through VLAHost's intervention-aware
+  # /action_chunk endpoint, while still polling /state once per low-level step.
+  action_transport: chunk
+  # Physical per-step target-change limits: 14 joints (rad); null disables
+  # the limit for the two grippers.
+  enforce_action_delta_limit: true
+  max_action_delta: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10,
+                      0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10,
+                      null, null]
+  # Also cap total motion over the full 30-step chunk relative to the
+  # observation used for inference, so per-step limits cannot accumulate.
+  enforce_chunk_action_delta_limit: true
+  max_chunk_action_delta: [0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50,
+                            0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50,
+                            null, null]
+  image_split_mode: hero3
+  image_width: 640
+  image_height: 480
+  max_num_steps: 9000
+  # Open both normalized 1-DoF grippers after /go_home is accepted.
+  reset_gripper_position: 0.0
+  task_description: ${oc.env:ZADAI_TASK,Insert the tail of the yellow cable tie into its head to fasten it.}
+  is_dummy: ${oc.env:ZADAI_DUMMY,false}
+  intervention_session: true
+  intervention_refresh_s: 0.5
+  runtime_log_path: ${oc.env:ZADAI_RLT_RUNTIME_LOG,${runner.logger.log_path}/rlt_runtime.jsonl}
+  # Extra human re-positioning time after the ROS/VLAHost go_home response.
+  # VLAHost has its own planner synchronization wait; this is task-side wait.
+  reset_wait_s: 5.0

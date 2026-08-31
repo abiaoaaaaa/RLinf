@@ -31,6 +31,9 @@ from openpi.training.config import (
 from rlinf.models.embodiment.openpi.dataconfig.behavior_dataconfig import (
     LeRobotBehaviorDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.bimanual_joint_dataconfig import (
+    LeRobotBimanualJointDataConfig,
+)
 from rlinf.models.embodiment.openpi.dataconfig.calvin_dataconfig import (
     LeRobotCalvinDataConfig,
 )
@@ -73,8 +76,46 @@ from rlinf.models.embodiment.openpi.dataconfig.robocasa_dataconfig import (
 from rlinf.models.embodiment.openpi.dataconfig.robotwin_aloha_dataconfig import (
     LeRobotAlohaDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.zadai_eef_rot6d_dataconfig import (
+    LeRobotZadaiEefRot6dDataConfig,
+)
 
 _CONFIGS = [
+    TrainConfig(
+        name="pi05_hhw_tj_zadai_200_uniform",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotBimanualJointDataConfig(
+            repo_id="zadai_200",
+            base_config=DataConfig(prompt_from_task=False),
+            assets=AssetsConfig(
+                assets_dir="checkpoints/torch/pi05_hhw_tj_zadai_200_uniform/assets",
+                asset_id="zadai_200",
+            ),
+            default_prompt=(
+                "Insert the tail of the yellow cable tie into its head to fasten it."
+            ),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "checkpoints/jax/pi05_hhw_tj_zadai_200_uniform"
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_hhw_tj_zadai_200_uniform",
+        num_workers=0,
+    ),
+    TrainConfig(
+        name="pi05_zadai_eef_rot6d",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=50),
+        data=LeRobotZadaiEefRot6dDataConfig(
+            repo_id="zadai_200_eef_rot6d_rlinf_v21",
+            base_config=DataConfig(prompt_from_task=False),
+            assets=AssetsConfig(
+                assets_dir="checkpoints/torch/pi05_zadai_eef_rot6d/assets",
+                asset_id="zadai_200_eef_rot6d",
+            ),
+            extra_delta_transform=True,
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        num_workers=0,
+    ),
     TrainConfig(
         name="pi0_libero",
         model=pi0_config.Pi0Config(),

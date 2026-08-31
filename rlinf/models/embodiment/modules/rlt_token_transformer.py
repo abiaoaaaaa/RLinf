@@ -19,6 +19,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def freeze_non_rlt_parameters(model: nn.Module, rlt_module: nn.Module) -> int:
+    """Freeze a feature model while leaving its RLT compressor trainable."""
+    for param in model.parameters():
+        param.requires_grad = False
+    for param in rlt_module.parameters():
+        param.requires_grad = True
+    return sum(param.numel() for param in rlt_module.parameters())
+
+
 def sinusoidal_pe_init(seq_len: int, embed_dim: int) -> torch.Tensor:
     position = torch.arange(seq_len, dtype=torch.float32).unsqueeze(1)
     div_term = torch.exp(
