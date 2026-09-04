@@ -5,7 +5,9 @@
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 
+from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.realworld.zadai.action_codec import (
     ACTION_HIGH,
     ACTION_LOW,
@@ -53,6 +55,40 @@ def test_zadai_eef_codec_round_trip_preserves_valid_pose():
 
     assert normalized.shape == (20,)
     np.testing.assert_allclose(decoded, physical, atol=1e-6)
+
+
+def test_realworld_prepare_actions_converts_zadai_openpi_physical_eef():
+    identity = np.asarray([1, 0, 0, 0, 1, 0], dtype=np.float32)
+    physical = np.concatenate(
+        [
+            (DEFAULT_EEF_XYZ_LOW[0] + DEFAULT_EEF_XYZ_HIGH[0]) / 2,
+            identity,
+            [0.25],
+            (DEFAULT_EEF_XYZ_LOW[1] + DEFAULT_EEF_XYZ_HIGH[1]) / 2,
+            identity,
+            [0.75],
+        ]
+    ).astype(np.float32)
+    physical_chunk = physical.reshape(1, 1, 20)
+    env_cfg = OmegaConf.create(
+        {
+            "model_action_encoding": "zadai_physical_absolute",
+            "override_cfg": {"control_space": "eef"},
+        }
+    )
+
+    normalized = prepare_actions(
+        raw_chunk_actions=physical_chunk,
+        env_type="realworld",
+        model_type="openpi",
+        num_action_chunks=1,
+        action_dim=20,
+        env_cfg=env_cfg,
+    )
+
+    np.testing.assert_allclose(
+        eef_normalized_to_absolute(normalized), physical_chunk, atol=1e-6
+    )
 
 
 def test_zadai_rot6d_quaternion_round_trip():

@@ -25,10 +25,10 @@ ACTION_HIGH = np.concatenate([JOINT_HIGH, [1.0, 1.0]]).astype(np.float32)
 # demonstrations with margin and can later be made task-specific without
 # changing the Stage 2 action semantics.
 DEFAULT_EEF_XYZ_LOW = np.asarray(
-    [[0.20, -0.10, 0.65], [0.15, -0.45, 0.65]], dtype=np.float32
+    [[0.10, -0.20, 0.55], [0.05, -0.55, 0.55]], dtype=np.float32
 )
 DEFAULT_EEF_XYZ_HIGH = np.asarray(
-    [[0.70, 0.55, 1.10], [0.60, 0.10, 1.12]], dtype=np.float32
+    [[0.80, 0.65, 1.20], [0.70, 0.20, 1.22]], dtype=np.float32
 )
 
 
@@ -119,6 +119,26 @@ def matrix_to_rot6d(matrix: np.ndarray) -> np.ndarray:
     if matrix.shape[-2:] != (3, 3):
         raise ValueError(f"rotation matrix must end in (3, 3), got {matrix.shape}")
     return np.concatenate([matrix[..., :, 0], matrix[..., :, 1]], axis=-1)
+
+
+def shift_eef_tool_frame(action, local_x_offset_m: float):
+    """Shift bilateral EEF positions along each pose's local X axis.
+
+    This maps poses between two tool frames that share orientation and differ
+    only by a fixed translation along local X. Positive offsets move the
+    represented point farther along local +X. The 20-D input layout and
+    gripper values are preserved.
+    """
+    if action.shape[-1] != EEF_ACTION_DIM:
+        raise ValueError(f"EEF action must end in 20 values, got {action.shape}")
+    result = action.clone() if torch.is_tensor(action) else np.array(action, copy=True)
+    for offset in (0, 10):
+        rotation = canonicalize_rot6d(action[..., offset + 3 : offset + 9])
+        result[..., offset : offset + 3] = (
+            action[..., offset : offset + 3]
+            + float(local_x_offset_m) * rotation[..., :3]
+        )
+    return result
 
 
 def quaternion_xyzw_to_rot6d(quaternion: np.ndarray) -> np.ndarray:

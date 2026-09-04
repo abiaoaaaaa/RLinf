@@ -430,7 +430,11 @@ def _chunk_starts(interval: list[int], chunk_size: int) -> list[int]:
 def export(args: argparse.Namespace) -> None:
     import pyarrow.parquet as pq
 
-    from rlinf.envs.realworld.zadai.action_codec import eef_absolute_to_normalized
+    from rlinf.envs.realworld.zadai.action_codec import (
+        DEFAULT_EEF_XYZ_HIGH,
+        DEFAULT_EEF_XYZ_LOW,
+        eef_absolute_to_normalized,
+    )
 
     dataset = args.dataset.resolve()
     output = args.output.resolve()
@@ -559,6 +563,8 @@ def export(args: argparse.Namespace) -> None:
                 "norm_stats": str(args.norm_stats.resolve()),
                 "source_action_representation": "absolute_bilateral_eef_xyz_rot6d_gripper_20d",
                 "replay_action_representation": "normalized_bilateral_eef_xyz_rot6d_gripper_20d",
+                "eef_xyz_low": DEFAULT_EEF_XYZ_LOW.tolist(),
+                "eef_xyz_high": DEFAULT_EEF_XYZ_HIGH.tolist(),
                 "chunk_size": args.chunk_size,
                 "z_rl_compatibility": "must use the same Stage-1 checkpoint family",
             },

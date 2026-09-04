@@ -306,6 +306,31 @@ def prepare_actions_for_d4rl(
     return chunk_actions
 
 
+def prepare_actions_for_realworld(raw_chunk_actions, env_cfg=None):
+    """Convert explicitly declared real-world model action encodings.
+
+    Zadai Stage 2 policies emit the environment's normalized policy domain,
+    while the Zadai OpenPI output transform emits physical absolute targets.
+    Keep the default pass-through behavior and require the evaluation config
+    to opt into the physical-to-policy conversion.
+    """
+    encoding = (
+        env_cfg.get("model_action_encoding", "policy")
+        if env_cfg is not None
+        else "policy"
+    )
+    if encoding == "policy":
+        return raw_chunk_actions
+    if encoding == "zadai_physical_absolute":
+        from rlinf.envs.realworld.zadai.action_codec import absolute_to_policy
+
+        control_space = env_cfg.get("override_cfg", {}).get(
+            "control_space", "joint"
+        )
+        return absolute_to_policy(raw_chunk_actions, control_space)
+    raise ValueError(f"unsupported real-world model_action_encoding: {encoding!r}")
+
+
 def prepare_actions_for_roboverse(
     raw_chunk_actions,
     model_type,
@@ -394,7 +419,10 @@ def prepare_actions(
             action_space=policy,
         )
     elif env_type == SupportedEnvType.REALWORLD:
-        chunk_actions = raw_chunk_actions
+        chunk_actions = prepare_actions_for_realworld(
+            raw_chunk_actions=raw_chunk_actions,
+            env_cfg=env_cfg,
+        )
     elif env_type == SupportedEnvType.GENESIS:
         chunk_actions = prepare_actions_for_genesis(
             raw_chunk_actions=raw_chunk_actions,

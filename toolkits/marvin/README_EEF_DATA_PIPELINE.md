@@ -91,7 +91,7 @@ python3 toolkits/marvin/convert_joint_lerobot_to_eef.py \
   --src /home/zzx23457/Data/lerobot/zadai_200 \
   --dst /home/zzx23457/Data/lerobot/zadai_200_eef_rot6d \
   --rlinf-v21-dst /home/zzx23457/Data/lerobot/zadai_200_eef_rot6d_rlinf_v21 \
-  --mjcf /home/zzx23457/ws_apex/Apex_Deploy-main/robot_node/marvin_description/mjcf/marvin_pro_mink.xml \
+  --mjcf /home/zzx23457/ws_apex/Apex_Deploy-main/robot_node/marvin_description/mjcf/matrix/m6_696.xml \
   --media-mode hardlink
 ```
 
@@ -324,7 +324,7 @@ python3 toolkits/realworld_check/validate_zadai_eef_control.py \
 python3 toolkits/marvin/convert_online_buffer_joint_to_eef.py \
   --src /home/zzx23457/code_xlb/RLinf/replay_buffers/zadai_200_rlt_stage2/rank_0 \
   --dst /home/zzx23457/code_xlb/RLinf/replay_buffers/zadai_200_rlt_stage2_eef/rank_0 \
-  --mjcf /home/zzx23457/ws_apex/Apex_Deploy-main/robot_node/marvin_description/mjcf/marvin_pro_mink.xml
+  --mjcf /home/zzx23457/ws_apex/Apex_Deploy-main/robot_node/marvin_description/mjcf/matrix/m6_696.xml
 ```
 
 程序将动作和 reference 字段写成 20D normalized EEF policy domain；`proprio` 保持 20D physical absolute EEF：

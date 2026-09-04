@@ -37,7 +37,7 @@ Example::
         --src /path/to/zadai_200 \
         --dst /path/to/zadai_200_eef \
         --rlinf-v21-dst /path/to/zadai_200_eef_rlinf_v21 \
-        --mjcf /path/to/Apex_Deploy-main/robot_node/marvin_description/mjcf/marvin_pro_mink.xml
+        --mjcf /path/to/Apex_Deploy-main/robot_node/marvin_description/mjcf/matrix/m6_696.xml
 """
 
 from __future__ import annotations
@@ -608,7 +608,7 @@ def main() -> int:
         "--mjcf",
         type=Path,
         required=True,
-        help="Exact APEX MJCF used by the robot (for example marvin_pro_mink.xml)",
+        help="Exact runtime APEX MJCF used by the robot (for example matrix/m6_696.xml)",
     )
     parser.add_argument(
         "--media-mode",

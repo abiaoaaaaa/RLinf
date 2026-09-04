@@ -37,6 +37,16 @@ override_cfg:
   # VLAHost plays absolute waypoints at this rate; /state remains sampled per step.
   step_frequency: 30.0
   action_mode: absolute
+  # Match VLAHost's physical Cartesian safety boxes. The OpenPI/RLT codec keeps
+  # its wider dataset normalization range, then ZadaiEnv clips executable
+  # targets into these boxes before serializing them. A one-micrometre inward
+  # margin is applied by ZadaiEnv to avoid float32 boundary round-off.
+  eef_xyz_low:
+    - [0.20, -0.10, 0.65]
+    - [0.15, -0.45, 0.65]
+  eef_xyz_high:
+    - [0.70, 0.55, 1.10]
+    - [0.60, 0.10, 1.12]
   # Submit each 30-step policy output through VLAHost's intervention-aware
   # /action_chunk endpoint, while still polling /state once per low-level step.
   action_transport: chunk

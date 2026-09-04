@@ -35,7 +35,14 @@ from .action_codec import (
     policy_to_absolute,
     quaternion_xyzw_to_rot6d,
     rot6d_to_quaternion_xyzw,
+    shift_eef_tool_frame,
 )
+
+# Keep serialized float32 Cartesian targets strictly inside VLAHost's float64
+# workspace. For example, float32(0.80) is 0.8000000119 and can otherwise sit
+# just above an inclusive 0.80 m upper bound. One micrometre is far below the
+# controller resolution and does not relax the physical safety envelope.
+EEF_WORKSPACE_NUMERICAL_MARGIN_M = 1e-6
 
 
 def _image_from_state(
@@ -144,6 +151,21 @@ def _eef_wire_action_to_rot6d(value: Any, name: str) -> np.ndarray:
     ).astype(np.float32)
 
 
+def _clamp_translation_norm(
+    target: np.ndarray, reference: np.ndarray, max_distance: float
+) -> np.ndarray:
+    """Clamp a Cartesian target by Euclidean distance from its reference."""
+    delta = np.asarray(target, dtype=np.float32) - np.asarray(
+        reference, dtype=np.float32
+    )
+    distance = float(np.linalg.norm(delta))
+    if distance <= max_distance:
+        return np.asarray(target, dtype=np.float32)
+    return np.asarray(reference, dtype=np.float32) + delta * (
+        max_distance / max(distance, 1e-12)
+    )
+
+
 @dataclass
 class Zadai200RobotConfig:
     server_url: str = "http://127.0.0.1:8010"
@@ -196,6 +218,11 @@ class Zadai200RobotConfig:
     max_eef_rotation_delta_rad: float = 0.12
     max_eef_angular_velocity_rad_s: float = 1.5
     max_eef_chunk_rotation_delta_rad: float = 0.50
+    # Compatibility for EEF checkpoints trained with a shorter virtual tool.
+    # A positive value shifts policy-frame targets along local +X before they
+    # are sent to the runtime robot frame, and applies the inverse shift to
+    # runtime observations. The legacy 50 mm -> M6-696 145 mm mapping is 0.095.
+    eef_policy_to_runtime_tool_offset_m: float = 0.0
 
     def __post_init__(self):
         if self.action_mode != "absolute":
@@ -220,6 +247,8 @@ class Zadai200RobotConfig:
             raise ValueError("max_eef_angular_velocity_rad_s must be positive")
         if self.max_eef_chunk_rotation_delta_rad <= 0:
             raise ValueError("max_eef_chunk_rotation_delta_rad must be positive")
+        if not np.isfinite(self.eef_policy_to_runtime_tool_offset_m):
+            raise ValueError("eef_policy_to_runtime_tool_offset_m must be finite")
         if len(self.max_action_delta) != 16 or any(
             value is not None and float(value) <= 0 for value in self.max_action_delta
         ):
@@ -269,6 +298,10 @@ class Zadai200Env(gym.Env):
         self._last_session_refresh = 0.0
         self._last_action_sent_at: float | None = None
         self._last_observed_physical: np.ndarray | None = None
+        # Chunk boundaries should be continuous even when feedback lags the
+        # previous command by one control cycle.  This is only a reference for
+        # rate limiting; observations and replay still use measured state.
+        self._last_commanded_physical: np.ndarray | None = None
         self._last_intervention_refresh_generation = 0
         self._submitted_chunk: list[dict[str, Any]] | None = None
         self._submitted_chunk_index = 0
@@ -282,6 +315,9 @@ class Zadai200Env(gym.Env):
                 "step_frequency_hz": self.config.step_frequency,
                 "action_mode": self.config.action_mode,
                 "max_action_delta": self.config.max_action_delta,
+                "eef_policy_to_runtime_tool_offset_m": (
+                    self.config.eef_policy_to_runtime_tool_offset_m
+                ),
             },
         )
         self._last_images: dict[str, np.ndarray] | None = None
@@ -306,10 +342,12 @@ class Zadai200Env(gym.Env):
             self._physical_action_high = np.full(20, np.inf, dtype=np.float32)
             for arm, offset in enumerate((0, 10)):
                 self._physical_action_low[offset : offset + 3] = (
-                    self.config.eef_xyz_low[arm]
+                    np.asarray(self.config.eef_xyz_low[arm], dtype=np.float64)
+                    + EEF_WORKSPACE_NUMERICAL_MARGIN_M
                 )
                 self._physical_action_high[offset : offset + 3] = (
-                    self.config.eef_xyz_high[arm]
+                    np.asarray(self.config.eef_xyz_high[arm], dtype=np.float64)
+                    - EEF_WORKSPACE_NUMERICAL_MARGIN_M
                 )
                 self._physical_action_low[offset + 9] = 0.0
                 self._physical_action_high[offset + 9] = 1.0
@@ -480,8 +518,12 @@ class Zadai200Env(gym.Env):
         else:
             left_pose = _eef_pose_to_xyz_rot6d(state.get("eef_left"), "eef_left")
             right_pose = _eef_pose_to_xyz_rot6d(state.get("eef_right"), "eef_right")
-            self._last_observed_physical = np.concatenate(
+            runtime_eef = np.concatenate(
                 [left_pose, grippers[:1], right_pose, grippers[1:]]
+            ).astype(np.float32)
+            self._last_observed_physical = shift_eef_tool_frame(
+                runtime_eef,
+                -self.config.eef_policy_to_runtime_tool_offset_m,
             ).astype(np.float32)
             robot_state = {"a_eef_state": self._last_observed_physical.copy()}
         raw_obs = {"state": robot_state, "frames": images}
@@ -495,6 +537,11 @@ class Zadai200Env(gym.Env):
                 intervention.get("refresh_generation", 0)
             )
             info["intervene_flag"] = bool(intervention.get("intervene_flag", False))
+            if info["intervene_flag"]:
+                # Human/QP takeover invalidates the previous command as a
+                # chunk-boundary reference; re-anchor the next chunk to the
+                # measured pose.
+                self._last_commanded_physical = None
             suffix = "_eef" if self.config.control_space == "eef" else ""
             info["policy_action"] = intervention.get(f"policy_action{suffix}")
             info["human_action"] = intervention.get(f"human_action{suffix}")
@@ -503,6 +550,10 @@ class Zadai200Env(gym.Env):
                 for key in ("policy_action", "human_action", "executed_action"):
                     if info[key] is not None:
                         info[key] = _eef_wire_action_to_rot6d(info[key], key)
+                        info[key] = shift_eef_tool_frame(
+                            info[key],
+                            -self.config.eef_policy_to_runtime_tool_offset_m,
+                        ).astype(np.float32)
             if (
                 self.config.control_space == "eef"
                 and info["intervene_flag"]
@@ -528,6 +579,7 @@ class Zadai200Env(gym.Env):
         self._submitted_chunk = None
         self._submitted_chunk_index = 0
         self._submitted_chunk_started_at = None
+        self._last_commanded_physical = None
         if self.config.is_dummy:
             return self._dummy_observation(), {}
         result = self._session.post(self._url("go_home"), timeout=self.config.timeout)
@@ -621,23 +673,19 @@ class Zadai200Env(gym.Env):
             )
             for offset in (0, 10):
                 if self.config.enforce_action_delta_limit and reference is not None:
-                    physical_action[offset : offset + 3] = np.clip(
+                    physical_action[offset : offset + 3] = _clamp_translation_norm(
                         physical_action[offset : offset + 3],
-                        reference[offset : offset + 3]
-                        - self.config.max_eef_translation_delta,
-                        reference[offset : offset + 3]
-                        + self.config.max_eef_translation_delta,
+                        reference[offset : offset + 3],
+                        self.config.max_eef_translation_delta,
                     )
                 if (
                     self.config.enforce_chunk_action_delta_limit
                     and chunk_reference is not None
                 ):
-                    physical_action[offset : offset + 3] = np.clip(
+                    physical_action[offset : offset + 3] = _clamp_translation_norm(
                         physical_action[offset : offset + 3],
-                        chunk_reference[offset : offset + 3]
-                        - self.config.max_eef_chunk_translation_delta,
-                        chunk_reference[offset : offset + 3]
-                        + self.config.max_eef_chunk_translation_delta,
+                        chunk_reference[offset : offset + 3],
+                        self.config.max_eef_chunk_translation_delta,
                     )
                 rotation = slice(offset + 3, offset + 9)
                 if self.config.enforce_action_delta_limit and reference is not None:
@@ -677,6 +725,19 @@ class Zadai200Env(gym.Env):
                 "gripper_left": float(physical_action[14]),
                 "gripper_right": float(physical_action[15]),
             }
+        # This is the common wire boundary for reference, actor, and
+        # post-intervention/reset hold actions. Clamp here as a final defense
+        # because measured feedback or a handoff target can itself sit just
+        # outside the configured box.
+        physical_action = shift_eef_tool_frame(
+            np.asarray(physical_action, dtype=np.float32),
+            self.config.eef_policy_to_runtime_tool_offset_m,
+        ).astype(np.float32)
+        physical_action = np.clip(
+            physical_action,
+            self._physical_action_low,
+            self._physical_action_high,
+        )
         left_quat = rot6d_to_quaternion_xyzw(physical_action[3:9])
         right_quat = rot6d_to_quaternion_xyzw(physical_action[13:19])
         return {
@@ -702,12 +763,13 @@ class Zadai200Env(gym.Env):
                 f"{actions.shape}"
             )
         prepared = []
-        reference = self._last_observed_physical
-        chunk_reference = (
-            None
-            if self._last_observed_physical is None
-            else self._last_observed_physical.copy()
+        last_commanded = getattr(self, "_last_commanded_physical", None)
+        reference = (
+            last_commanded
+            if last_commanded is not None
+            else self._last_observed_physical
         )
+        chunk_reference = None if reference is None else reference.copy()
         for action in actions:
             step = self._prepare_physical_action(
                 action,
@@ -735,6 +797,8 @@ class Zadai200Env(gym.Env):
         if not result.get("success", False):
             raise RuntimeError(f"VLAHost rejected action chunk: {result}")
         self._submitted_chunk = prepared
+        if prepared:
+            self._last_commanded_physical = prepared[-1]["physical_action"].copy()
         self._submitted_chunk_index = 0
         self._submitted_chunk_started_at = time.monotonic()
         append_runtime_event(
@@ -791,6 +855,7 @@ class Zadai200Env(gym.Env):
                 result = response.json()
                 if not result.get("success", False):
                     raise RuntimeError(f"VLAHost rejected action: {result}")
+                self._last_commanded_physical = physical_action.copy()
             # Match the Franka env contract: wait for the remainder of the
             # control period, then read the observation that follows this
             # command.  This keeps each replay transition step-aligned.

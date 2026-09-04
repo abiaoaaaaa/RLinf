@@ -1,0 +1,230 @@
+defaults:
+  - env/zadai_200_http@env.train
+  - env/zadai_200_http@env.eval
+  - model/pi0_5@actor.model
+  - hybrid_engines/fsdp@actor.fsdp_config
+  - weight_syncer/patch_syncer@weight_syncer
+  - override hydra/job_logging: stdout
+  - _self_
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+# Stage 1 OpenPI-only RTC evaluation for the Zadai 200 bilateral EEF setup.
+# This configuration does not start Stage 2, train a model, or write replay data.
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor: {node_group: "4090", placement: 0}
+    env: {node_group: "4090", placement: 0}
+    rollout: {node_group: "4090", placement: 0}
+  node_groups:
+    - label: "4090"
+      node_ranks: 0
+
+runner:
+  task_type: embodied
+  rtc:
+    enabled: true
+    # Real hardware supplies the control-period delay; do not inject another one.
+    inject_delay_ms: 0
+    chunk_pause_seconds: 0.0
+    fixed_delay_steps: 0
+    min_exec_horizon: 2
+    initial_delay_steps: 1
+    delay_buffer_size: 8
+  logger:
+    log_path: ../results
+    project_name: rlinf-rlt
+    experiment_name: zadai_200_eef_pi05_stage1_RTC
+    logger_backends: [tensorboard]
+  max_epochs: 1
+  max_steps: -1
+  only_eval: true
+  stop_eval_on_keyboard_success: false
+  val_check_interval: -1
+  save_interval: -1
+  resume_dir: null
+  ckpt_path: null
+
+# These values satisfy the shared embodied configuration contract. No update is
+# performed because runner.only_eval is true and the eval entrypoint launches no actor.
+algorithm:
+  group_size: 1
+  rollout_epoch: 1
+  eval_rollout_epoch: 1
+  update_epoch: 1
+  adv_type: gae
+  loss_type: decoupled_actor_critic
+  reward_type: chunk_level
+  logprob_type: chunk_level
+  entropy_type: chunk_level
+  normalize_advantages: true
+  loss_agg_func: token-mean
+  gamma: 0.99
+  gae_lambda: 0.95
+  kl_beta: 0.0
+  entropy_bonus: 0.0
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 0.2
+  huber_delta: 10.0
+  reward_coef: 1.0
+  staleness_threshold: 1
+  behave_weight_threshold: 2
+  filter_rewards: false
+  rewards_lower_bound: 0.0
+  rewards_upper_bound: 1.0
+  sampling_params:
+    do_sample: true
+    temperature_train: 1.0
+    temperature_eval: 0.6
+    top_k: 50
+    top_p: 1.0
+    repetition_penalty: 1.0
+    add_BOS: false
+  length_params:
+    max_new_token: null
+    max_length: 1024
+    min_length: 1
+
+env:
+  group_name: EnvGroup
+  train:
+    keyboard_reward_wrapper: null
+    data_collection:
+      enabled: false
+    override_cfg:
+      control_space: eef
+      eef_policy_to_runtime_tool_offset_m: 0.0
+  eval:
+    rollout_epoch: 1
+    # One RTC evaluation lasts at most 30 seconds at 30 Hz.
+    max_steps_per_rollout_epoch: 900
+    max_episode_steps: 900
+    keyboard_reward_wrapper: null
+    # The Zadai OpenPI output transform returns physical absolute EEF poses;
+    # ZadaiEnv itself accepts normalized policy actions.
+    model_action_encoding: zadai_physical_absolute
+    use_spacemouse: false
+    video_cfg:
+      save_video: false
+    data_collection:
+      enabled: false
+    override_cfg:
+      control_space: eef
+      eef_policy_to_runtime_tool_offset_m: 0.0
+      # RTC calls env.step() once per action. Native queued /action_chunk is
+      # intentionally disabled for this evaluation path.
+      action_transport: action
+      # Keep VLAHost's foot-pedal ownership/heartbeat active. This is separate
+      # from the disabled RLinf keyboard wrapper and also refreshes the HTTP
+      # connection after reset_wait_s before the first /state request.
+      intervention_session: true
+      max_num_steps: 900
+      # Stay slightly inside VLAHost's 0.025 m / 0.05 rad effective limits so
+      # quaternion conversion and feedback timing cannot turn equality into a
+      # rejected single-frame /action request.
+      max_eef_translation_delta: 0.02
+      max_eef_chunk_translation_delta: 0.20
+      max_eef_rotation_delta_rad: 0.04
+      max_eef_angular_velocity_rad_s: 1.2
+      max_eef_chunk_rotation_delta_rad: 0.80
+
+rollout:
+  group_name: RolloutGroup
+  generation_backend: huggingface
+  recompute_logprobs: false
+  enable_offload: false
+  pipeline_stage_num: 1
+  collect_transitions: false
+  enable_torch_compile: false
+  enable_cuda_graph: false
+  model:
+    model_path: ${oc.env:ZADAI_EEF_STAGE1_CHECKPOINT,/home/zzx23457/Data/checkpoints/zadai_eef_stage1_global_step_15000/actor}
+    model_type: openpi
+    precision: null
+    is_lora: false
+    num_action_chunks: 50
+    action_dim: 20
+    num_steps: 10
+    rewrite_chunk_gripper: false
+    openpi_data:
+      repo_id: zadai_200_eef_rot6d
+      norm_stats_path: ${oc.env:ZADAI_EEF_NORM_STATS,/home/zzx23457/Data/lerobot/zadai_200_eef_norm_stats_m6_696/norm_stats.json}
+    openpi:
+      config_name: pi05_zadai_eef_rot6d
+      num_images_in_input: 3
+      action_horizon: 50
+      action_chunk: ${rollout.model.num_action_chunks}
+      action_env_dim: ${rollout.model.action_dim}
+      num_steps: ${rollout.model.num_steps}
+      train_expert_only: false
+      detach_critic_input: true
+      use_rlt: true
+      rlt_train_only: false
+      rlt_prefix_seq_len: 1024
+      rlt_image_only: false
+      rlt_use_mask: true
+      rtc_enabled: ${runner.rtc.enabled}
+      rtc_guidance_mode: approx
+      rtc_guidance_clip: 5.0
+
+# RTC validation currently checks that the actor model type is OpenPI even
+# though only the rollout model is instantiated by the evaluation entrypoint.
+actor:
+  group_name: ActorGroup
+  training_backend: fsdp
+  micro_batch_size: 1
+  global_batch_size: 1
+  seed: 42
+  enable_offload: false
+  model:
+    model_path: ${rollout.model.model_path}
+    model_type: openpi
+    precision: null
+    is_lora: false
+    lora_rank: 32
+    num_action_chunks: ${rollout.model.num_action_chunks}
+    action_dim: ${rollout.model.action_dim}
+    num_steps: ${rollout.model.num_steps}
+    add_value_head: false
+    openpi_data:
+      repo_id: zadai_200_eef_rot6d
+      norm_stats_path: ${oc.env:ZADAI_EEF_NORM_STATS,/home/zzx23457/Data/lerobot/zadai_200_eef_norm_stats_m6_696/norm_stats.json}
+    openpi:
+      config_name: pi05_zadai_eef_rot6d
+      num_images_in_input: 3
+      action_horizon: 50
+      action_chunk: ${actor.model.num_action_chunks}
+      action_env_dim: ${actor.model.action_dim}
+      num_steps: ${actor.model.num_steps}
+      train_expert_only: false
+      detach_critic_input: true
+      use_rlt: true
+      rlt_train_only: false
+      rlt_prefix_seq_len: 1024
+      rlt_image_only: false
+      rlt_use_mask: true
+      rtc_enabled: ${runner.rtc.enabled}
+      rtc_guidance_mode: approx
+      rtc_guidance_clip: 5.0
+  optim:
+    lr: 1.0e-5
+    value_lr: 1.0e-4
+    adam_beta1: 0.9
+    adam_beta2: 0.95
+    adam_eps: 1.0e-8
+    clip_grad: 1.0
+    critic_warmup_steps: 0
+
+reward:
+  use_reward_model: false
+
+critic:
+  use_critic_model: false
