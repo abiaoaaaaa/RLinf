@@ -1,0 +1,51 @@
+RLinf Git 管理规则（个人 Fork 工作流）
+========================================
+
+仓库角色
+--------
+- upstream = 官方仓库 git@github.com:RLinf/RLinf.git
+  只允许 fetch / pull，严禁 push。此仓库已将 upstream 的 push 地址设为 DISABLED。
+- origin = 个人 Fork git@github.com:abiaoaaaaa/RLinf.git
+  所有个人提交、备份、分支同步和 PR 都推送到 origin。
+
+分支规则
+--------
+- main 只跟随 upstream/main；不要直接在 main 修改、提交或合并个人代码。
+- 所有实际开发都在 feat/*、fix/* 或 experiment/* 分支进行。
+- 当前主要开发分支：feat/zadai-residual-tracking。
+- backup/* 是保护分支，未经明确确认不得删除或强推覆盖。
+
+开始工作前：同步官方 main
+--------------------------
+git fetch upstream --prune
+git switch main
+git merge --ff-only upstream/main
+git push origin main
+
+更新功能分支
+------------
+git switch <feature-branch>
+git rebase main
+# 仅当该分支此前已推送且 rebase 成功后：
+git push --force-with-lease
+
+日常提交与跨电脑同步
+--------------------
+- 有价值的工作必须先 git add / git commit，再 git push origin <branch>。
+- 新电脑应从个人 Fork 克隆，再添加官方仓库为 upstream；不要克隆官方仓库后直接开发。
+- 不要用未提交改动或手工复制文件作为唯一备份。
+
+禁止项
+------
+- 禁止 git push upstream。
+- 禁止 git push --force；只可使用 git push --force-with-lease，且只用于自己的功能分支。
+- 禁止在 main 直接开发。
+- 未先检查 git status、未确认分支和远程前，禁止 reset --hard、checkout --、clean -fd、rebase 或合并。
+- 未经用户明确同意，AI 不得修改 remote URL、删除分支、删除 tag、推送 main，或创建/关闭 PR。
+
+当前迁移状态（2026-09-09）
+---------------------------
+- main 已同步到官方提交 1c9eed0。
+- feat/zadai-residual-tracking 基于较旧官方基线；升级前需专门处理 rebase 冲突，AI 不得自动 rebase。
+- 个人 Fork 已备份 feat/zadai-residual-tracking、feat/zadai-eef-stage2、
+  restore/marvin-joint 与 backup/zadai-residual-tracking-pre-fork-20260909。
