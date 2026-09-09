@@ -82,6 +82,20 @@ from rlinf.models.embodiment.openpi.dataconfig.zadai_eef_rot6d_dataconfig import
 
 _CONFIGS = [
     TrainConfig(
+        name="pi05_hhw_tj_zadai_335_uniform",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotBimanualJointDataConfig(
+            repo_id="zadai_335_rlinf_v21",
+            base_config=DataConfig(prompt_from_task=False),
+            assets=AssetsConfig(
+                assets_dir="checkpoints/zadai_335_pi05_pytorch_bfloat16/assets",
+                asset_id="zadai_335",
+            ),
+        ),
+        pytorch_weight_path="checkpoints/zadai_335_pi05_pytorch_bfloat16",
+        num_workers=0,
+    ),
+    TrainConfig(
         name="pi05_hhw_tj_zadai_200_uniform",
         model=pi0_config.Pi0Config(pi05=True),
         data=LeRobotBimanualJointDataConfig(

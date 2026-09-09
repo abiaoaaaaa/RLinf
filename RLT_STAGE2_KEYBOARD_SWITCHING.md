@@ -2,6 +2,24 @@
 
 本文记录 `zadai_200_rlt_stage2_ac_mlp` 真机训练中的键盘操作、控制权切换、奖励和 replay 行为。操作前请确认急停可用，并让机器人处于安全初始姿态。
 
+cd /home/zzx23457/code_xlb/RLinf
+
+  source .venv_openpi/bin/activate
+
+  export PYTHONPATH=$PWD:$PYTHONPATH
+  export ROBOT_PLATFORM=LIBERO
+
+  export ZADAI_VLAHOST_URL=http://127.0.0.1:8010
+  export ZADAI_REPLAY_BUFFER_PATH=$PWD/replay_buffers/zadai_200_rlt_stage2_residual
+
+  python examples/embodiment/train_embodied_agent.py \
+    --config-path examples/embodiment/config \
+    --config-name zadai_200_rlt_stage2_ac_mlp \
+    runner.resume_dir=/home/zzx23457/code_xlb/RLinf/logs/continue_20260827_zadai_200_rlt_stage2/
+    zadai_200_rlt_stage2_ac_mlp/checkpoints/global_step_270 \
+    runner.logger.log_path=$PWD/logs/zadai_200_rlt_stage2_residual
+
+
 ## 快速操作表
 
 | 按键 | 事件 | 切换后的状态 | Reward | 是否结束当前 RLT segment | 是否结束并重置 Gym episode |
@@ -136,19 +154,29 @@ RLinf 不会再对同一块重复发送 30 次 `POST /action`。
 
 ### Stage 2 动作限制
 
-Stage 2 actor 仍输出完整的 `30 x 16` 绝对动作 chunk，并未改成 residual
-策略。为避免刚切换到 actor 时出现大跳变，当前配置按以下三层约束动作：
+Stage 2 actor 仍输出完整的 `30 x 16` 绝对动作 chunk。兼容层先递归跟踪旧 actor
+输出，再将跟踪结果转换成相对 OpenPI 的 residual，并只对手臂 residual 做限幅和
+平滑。当前配置按以下层次处理动作：
 
 | 约束层 | 当前值 | 作用 |
 |---|---:|---|
-| Actor 第 1 个动作相对 OpenPI reference | 手臂每维 `0.02` normalized（约 `0.063 rad`），夹爪 `0` | 只限制 RL 接管瞬间的第一个目标；第 2–30 个 actor 动作不做 reference 投影 |
+| 旧 actor 递归 tracking | 每维每步 `0.02` normalized（约 `0.063 rad`） | 从实测关节状态开始追踪旧绝对动作，避免未处理的绝对目标直接跳变 |
+| residual 绝对幅度 | 手臂 `0.015` normalized（约 `0.047 rad`），夹爪 `0` | 将稳定段动作限制在 OpenPI reference 附近；夹爪始终使用 OpenPI reference |
+| residual FIR | `[1, 2, 3, 2, 1] / 9` | 利用完整 chunk 做对称低通，去除相邻帧高频反转 |
+| residual 相邻步变化 | 手臂 `0.003` normalized（约 `0.0094 rad`） | 限制 residual 斜率，而不是压低 OpenPI 本身的运动速度 |
+| chunk 接管过渡 | 前 10 步 cosine bridge | 保留原 tracking 的首帧，并在约 0.33 秒内平滑接入受限 residual |
 | 相邻低层动作 | 手臂每步 `0.1 rad` | 限制发送给 VLAHost 的相邻绝对关节目标变化 |
 | 整个 30-step chunk | 手臂累计 `0.5 rad` | 每个目标都相对本次推理时的实测关节位置裁剪，防止小步变化在 chunk 内累积成大漂移 |
 
-最后两层不限制夹爪（配置值为 `null`）。第一个动作的夹爪偏差为 `0`，因此
-接管瞬间沿用 OpenPI 夹爪目标；后续夹爪动作不做 reference 投影。Actor 更新中的
-Q 查询和 target Q 同样只投影 chunk 的第一个动作，使训练和部署一致。BC 项仍
-作用于 actor 的完整原始 chunk。
+物理环境的最后两层安全限制不限制夹爪（配置值为 `null`），但 residual 平滑层
+把两个夹爪 residual 固定为 `0`，所以整个 chunk 都沿用 OpenPI 夹爪目标。Actor
+更新中的 Q 查询和 target Q 使用相同的 tracking、FIR、residual 限幅和 cosine
+bridge，使训练和部署一致。BC 项仍作用于 actor 的完整原始 chunk。
+
+离线使用最新 replay 中非人工干预的 RL chunk 验证后，平均关节速度由约
+`0.40 rad/s` 降至 `0.08 rad/s`，平均加速度由约 `20.6 rad/s²` 降至
+`2.6 rad/s²`，相邻速度方向反转率由约 `64.5%` 降至 `29.6%`。这些结果只验证
+轨迹平滑性，任务成功率仍需真机测试确认。
 
 Replay 会保存经过本地物理限制、实际提交给 VLAHost 的动作；发生人工干预的
 位置随后仍以 VLAHost 返回的人工执行动作为准。该规则只影响新采集的数据，

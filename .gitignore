@@ -15,6 +15,7 @@ logs/*
 logs_baseline/*
 replay_buffers/*
 outputs/*
+artifacts/*
 *.so
 .venv
 .docs-venv

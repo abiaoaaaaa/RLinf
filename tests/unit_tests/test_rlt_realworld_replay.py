@@ -21,6 +21,8 @@ from rlinf.algorithms.rlt.route import (
     RealworldRLTRoute,
     RLTRouteContext,
     project_actions_to_reference,
+    reference_tracking_actions,
+    smooth_reference_residual_actions,
 )
 from rlinf.algorithms.rlt.transition import update_rlt_transitions
 from rlinf.data.embodied_io_struct import EmbodiedRolloutResult, Trajectory
@@ -97,6 +99,72 @@ def test_realworld_route_limits_online_actor_around_reference():
     torch.testing.assert_close(
         output.result["forward_inputs"]["action"], expected.reshape(1, -1)
     )
+
+
+def test_reference_tracking_residuals_are_recursive():
+    current = torch.tensor([[0.0]])
+    reference = torch.tensor([[[1.0], [1.0], [1.0]]])
+    residual = torch.tensor([[[0.0], [0.0], [-0.5]]])
+
+    tracked = reference_tracking_actions(current, reference, residual, 0.4)
+
+    # q_exec: 0 -> .4 -> .8 -> .5 (.8 + (.2 - .5))
+    torch.testing.assert_close(tracked, torch.tensor([[[0.4], [0.8], [0.5]]]))
+
+
+def test_reference_residual_smoothing_limits_oscillation_and_pins_dimensions():
+    reference = torch.zeros((1, 7, 2))
+    actions = torch.tensor(
+        [
+            [
+                [0.02, 0.5],
+                [-0.02, -0.5],
+                [0.02, 0.5],
+                [-0.02, -0.5],
+                [0.02, 0.5],
+                [-0.02, -0.5],
+                [0.02, 0.5],
+            ]
+        ],
+        requires_grad=True,
+    )
+
+    smoothed = smooth_reference_residual_actions(
+        actions,
+        reference,
+        max_abs_residual=[0.015, 0.0],
+        max_residual_step=[0.003, 0.0],
+        filter_kernel=[1.0, 2.0, 3.0, 2.0, 1.0],
+    )
+
+    assert torch.max(torch.abs(smoothed[..., 0])) <= 0.015
+    assert torch.max(torch.abs(torch.diff(smoothed[..., 0], dim=1))) <= 0.003
+    torch.testing.assert_close(smoothed[..., 1], reference[..., 1])
+    assert torch.mean(torch.abs(torch.diff(smoothed[..., 0], dim=1))) < torch.mean(
+        torch.abs(torch.diff(actions[..., 0], dim=1))
+    )
+    smoothed.sum().backward()
+    assert actions.grad is not None
+    assert torch.isfinite(actions.grad).all()
+
+
+def test_reference_residual_smoothing_cosine_bridge_preserves_handoff():
+    reference = torch.zeros((1, 6, 2))
+    reference[..., 1] = 1.1
+    actions = torch.tensor([[[0.2, 0.7]] * 6])
+
+    smoothed = smooth_reference_residual_actions(
+        actions,
+        reference,
+        max_abs_residual=[0.015, 0.0],
+        max_residual_step=[0.003, 0.0],
+        filter_kernel=[1.0],
+        boundary_blend_steps=4,
+    )
+
+    torch.testing.assert_close(smoothed[:, 0, 0], actions[:, 0, 0])
+    torch.testing.assert_close(smoothed[:, 4:, 0], torch.full((1, 2), 0.015))
+    torch.testing.assert_close(smoothed[..., 1], reference[..., 1])
 
 
 def test_eef_reference_projection_returns_valid_rot6d():

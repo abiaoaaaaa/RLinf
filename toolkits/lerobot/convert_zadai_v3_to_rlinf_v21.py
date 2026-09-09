@@ -71,8 +71,13 @@ def _validate_source(source: Path) -> tuple[dict, pa.Table, dict, dict]:
     info = _read_json(meta / "info.json")
     if info.get("codebase_version") != "v3.0":
         raise ValueError(f"expected LeRobot v3.0, got {info.get('codebase_version')!r}")
-    if info.get("fps") != 30 or info.get("total_episodes") != 200:
-        raise ValueError("expected the 200-episode, 30 FPS Zadai dataset")
+    total_episodes = info.get("total_episodes")
+    if info.get("fps") != 30:
+        raise ValueError(f"expected a 30 FPS Zadai dataset, got {info.get('fps')!r}")
+    if not isinstance(total_episodes, int) or total_episodes <= 0:
+        raise ValueError(
+            f"expected a positive integer total_episodes, got {total_episodes!r}"
+        )
     state_shape = info["features"]["observation.state"]["shape"]
     action_shape = info["features"]["action"]["shape"]
     if state_shape != action_shape or len(state_shape) != 1:
@@ -98,8 +103,11 @@ def _validate_source(source: Path) -> tuple[dict, pa.Table, dict, dict]:
 
     episode_table = pq.read_table(meta / "episodes/chunk-000/file-000.parquet")
     episodes = episode_table.to_pydict()
-    if episodes["episode_index"] != list(range(200)):
-        raise ValueError("episode indices must be contiguous from 0 to 199")
+    if episodes["episode_index"] != list(range(total_episodes)):
+        raise ValueError(
+            "episode indices must be contiguous from 0 to "
+            f"{total_episodes - 1}"
+        )
 
     data_files = sorted((source / "data").glob("chunk-*/*.parquet"))
     if not data_files:
@@ -167,6 +175,11 @@ def convert(source: Path, output: Path, video_mode: str) -> None:
                 raise ValueError(
                     f"episode {episode_index}: Parquet frame indices do not match metadata"
                 )
+            # LeRobot v3 Parquet files may embed Hugging Face feature metadata
+            # containing the newer ``List`` feature type. RLinf's pinned
+            # datasets version cannot deserialize it, but can infer the same
+            # Arrow columns correctly when this optional metadata is absent.
+            episode = episode.replace_schema_metadata(None)
             chunk = episode_index // chunks_size
             path = temp / f"data/chunk-{chunk:03d}/episode_{episode_index:06d}.parquet"
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -219,6 +232,9 @@ def convert(source: Path, output: Path, video_mode: str) -> None:
             != info["total_frames"]
         ):
             raise RuntimeError("converted Parquet frame count verification failed")
+        first_output_data = next((temp / "data").rglob("*.parquet"))
+        if pq.read_schema(first_output_data).metadata:
+            raise RuntimeError("converted Parquet schema metadata was not stripped")
         if len(list((temp / "videos").rglob("*.mp4"))) != target_info["total_videos"]:
             raise RuntimeError("converted video count verification failed")
         temp.rename(output)

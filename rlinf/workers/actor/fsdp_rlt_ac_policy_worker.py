@@ -17,7 +17,11 @@ import queue
 import torch
 import torch.nn.functional as F
 
-from rlinf.algorithms.rlt.route import project_actions_to_reference
+from rlinf.algorithms.rlt.route import (
+    apply_reference_residual_smoothing,
+    apply_reference_tracking,
+    project_actions_to_reference,
+)
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
 from rlinf.data.embodied_io_struct import Trajectory
 from rlinf.models.embodiment.base_policy import ForwardType
@@ -90,6 +94,33 @@ class RLTACLossMixin:
             constraint_cfg.get("constrained_steps"),
             constraint_cfg.get("action_space"),
         )
+        tracking_mode = constraint_cfg.get("tracking_mode", None)
+        if bool(constraint_cfg.get("enable", False)) and tracking_mode is not None:
+            if constraint_cfg.get("action_space") != "joint":
+                raise ValueError(
+                    "reference tracking is currently supported for joint actions"
+                )
+            tracking_max_step_delta = constraint_cfg.get("tracking_max_step_delta")
+            if tracking_max_step_delta is None:
+                raise ValueError("reference tracking requires tracking_max_step_delta")
+            from rlinf.envs.realworld.zadai.action_codec import absolute_to_policy
+
+            chunk_len, action_dim = self._chunk_shape()
+            current = absolute_to_policy(obs["proprio"], "joint")
+            action_chunk = apply_reference_tracking(
+                current,
+                ref_chunk,
+                actions.reshape(-1, chunk_len, action_dim),
+                mode=tracking_mode,
+                max_step_delta=tracking_max_step_delta,
+                residual_scale=constraint_cfg.get("residual_scale", 1.0),
+            )
+            action_chunk = apply_reference_residual_smoothing(
+                action_chunk,
+                ref_chunk,
+                constraint_cfg.get("residual_smoothing", None),
+            )
+            constrained = action_chunk.reshape(actions.shape[0], -1)
         return constrained.reshape(actions.shape[0], -1)
 
     @staticmethod

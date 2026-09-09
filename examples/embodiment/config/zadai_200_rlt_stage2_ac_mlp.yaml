@@ -60,6 +60,27 @@ algorithm:
     max_reference_delta: [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
                           0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
                           0.0, 0.0]
+    # Optional recursive tracking. ``absolute_compat`` keeps the legacy
+    # checkpoint output semantics and converts its absolute target to a
+    # residual before tracking. Set to null to retain the old projection path.
+    tracking_mode: absolute_compat
+    tracking_max_step_delta: [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
+                              0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
+                              0.02, 0.02]
+    residual_scale: 1.0
+    # Offline validation on the latest non-intervened replay chunks reduced
+    # mean joint acceleration from 20.6 to 2.6 rad/s^2. Smooth only the arm
+    # residual; zero limits pin both grippers to the OpenPI reference.
+    residual_smoothing:
+      enable: True
+      max_abs_residual: [0.015, 0.015, 0.015, 0.015, 0.015, 0.015, 0.015,
+                         0.015, 0.015, 0.015, 0.015, 0.015, 0.015, 0.015,
+                         0.0, 0.0]
+      max_residual_step: [0.003, 0.003, 0.003, 0.003, 0.003, 0.003, 0.003,
+                          0.003, 0.003, 0.003, 0.003, 0.003, 0.003, 0.003,
+                          0.0, 0.0]
+      filter_kernel: [1.0, 2.0, 3.0, 2.0, 1.0]
+      boundary_blend_steps: 10
   bootstrap_type: standard
   gamma: 0.96
   tau: 0.005
@@ -80,24 +101,9 @@ algorithm:
     auto_save: True
     auto_resume: True
     auto_save_path: ${oc.env:ZADAI_REPLAY_BUFFER_PATH,/home/zzx23457/code_xlb/RLinf/replay_buffers/zadai_200_rlt_stage2}
-  # Keep a fixed offline anchor while the replay buffer receives new online
-  # transitions. ReplayBufferDataset samples half of every training batch from
-  # this buffer and half from replay_buffer. The path must name a persisted
-  # TrajectoryReplayBuffer rank directory (metadata.json + trajectory_*.pt),
-  # not a LeRobot/Stage 1 demonstration dataset.
-  #
-  # By default, initialize it from the verified 30-step Stage 2 replay
-  # snapshot. At startup it is loaded into memory once, so subsequent writes to
-  # replay_buffer do not change the offline half of the batch. Override this
-  # path with ZADAI_DEMO_BUFFER_PATH after preparing a dedicated RLT demo
-  # buffer with the same z_rl/proprio/ref_chunk/action schema.
-  demo_buffer:
-    enable_cache: True
-    cache_size: 500
-    min_buffer_size: 1
-    sample_window_size: 500
-    load_path: ${oc.env:ZADAI_DEMO_BUFFER_PATH,/home/zzx23457/code_xlb/RLinf/replay_buffers/zadai_200_rlt_stage2/rank_0}
-    auto_save: False
+  # Online-only residual fine-tuning. Set this to a mapping only when an
+  # offline RLT demo buffer should be sampled as a second data source.
+  demo_buffer: null
   target_update_freq: 1
   target_update_type: all
   train_actor_steps: 100

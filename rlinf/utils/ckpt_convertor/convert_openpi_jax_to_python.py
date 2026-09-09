@@ -26,12 +26,13 @@ This script loads a JAX model checkpoint using orbax and can either:
 2. Convert the JAX model to PyTorch format using our PI0Pytorch model
 
 Usage:
-python rlinf/utils/ckpt_convertor/convert_openpi_jax_to_python.py
+python -m rlinf.utils.ckpt_convertor.convert_openpi_jax_to_python
     --checkpoint_dir /path/to/jax/checkpoint
     --output_path /path/to/pytorch/checkpoint
     --config_name pi0_aloha_pen_uncap
 """
 
+import gc
 import json
 import os
 import pathlib
@@ -335,7 +336,7 @@ def slice_paligemma_state_dict(state_dict, config):
     return final_state_dict, expert_dict
 
 
-def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi05):
+def slice_gemma_state_dict(state_dict, config, *, num_expert, pi05):
     """Convert Gemma JAX parameters to PyTorch format."""
     # Add missing attributes to config if they don't exist
     if not hasattr(config, "vocab_size"):
@@ -369,7 +370,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
     llm_mlp_linear = state_dict.pop(f"llm/layers/mlp_{num_expert}/linear{suffix}")
 
     # Check if we have Dense layers (for pi05/adaptive normalization) or scale layers (for regular pi0)
-    if "pi05" in checkpoint_dir:
+    if pi05:
         # Pi05 with adaptive normalization
         llm_input_layernorm_bias = state_dict.pop(
             f"llm/layers/pre_attention_norm_{num_expert}/Dense_0/bias{suffix}"
@@ -432,7 +433,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             f"paligemma_with_expert.gemma_expert.model.layers.{i}.mlp.down_proj.weight"
         ] = llm_mlp_linear[i].transpose()
 
-        if "pi05" in checkpoint_dir:
+        if pi05:
             # Pi05 with adaptive normalization - use Dense layer parameters directly
             state_dict[
                 f"paligemma_with_expert.gemma_expert.model.layers.{i}.input_layernorm.dense.bias"
@@ -456,7 +457,7 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
             ] = llm_post_attention_layernorm[i]
 
     # Handle final norm layer
-    if "pi05" in checkpoint_dir:
+    if pi05:
         # Pi05 with adaptive normalization - use Dense layer parameters directly
         final_norm_bias = state_dict.pop(
             f"llm/final_norm_{num_expert}/Dense_0/bias{suffix}"
@@ -528,6 +529,8 @@ def convert_pi0_checkpoint(
     precision: str,
     output_path: str,
     model_config: openpi.models.pi0_config.Pi0Config,
+    norm_stats_path: str | None = None,
+    asset_id: str | None = None,
 ):
     """
     Convert PI0 JAX checkpoint to PyTorch format.
@@ -621,25 +624,49 @@ def convert_pi0_checkpoint(
         expert_params,
         action_expert_config,
         num_expert=1,
-        checkpoint_dir=checkpoint_dir,
         pi05=model_config.pi05,
     )
 
-    # Instantiate model
-    pi0_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_config)
-
     # Combine all parameters (no prefix needed for our model structure)
     all_params = {**paligemma_params, **gemma_params, **projection_params}
-
-    # Load state dict
-    pi0_model.load_state_dict(all_params, strict=False)
+    del initial_params, paligemma_params, gemma_params, projection_params
+    gc.collect()
 
     if precision == "float32":
-        pi0_model = pi0_model.to(torch.float32)
+        target_dtype = torch.float32
     elif precision == "bfloat16":
-        pi0_model = pi0_model.to(torch.bfloat16)
+        target_dtype = torch.bfloat16
     else:
         raise ValueError(f"Invalid precision: {precision}")
+    for key, value in all_params.items():
+        if value.is_floating_point() and value.dtype != target_dtype:
+            all_params[key] = value.to(target_dtype)
+
+    # Avoid allocating and then replacing a second full set of model weights.
+    # This keeps conversion viable on workstations with about 60 GiB of RAM.
+    with torch.device("meta"):
+        pi0_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_config)
+    incompatible = pi0_model.load_state_dict(all_params, strict=False, assign=True)
+    allowed_missing = {
+        "paligemma_with_expert.paligemma.lm_head.weight",
+        "paligemma_with_expert.gemma_expert.lm_head.weight",
+    }
+    if set(incompatible.missing_keys) - allowed_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "converted state dict does not match PI0Pytorch: "
+            f"missing={incompatible.missing_keys}, "
+            f"unexpected={incompatible.unexpected_keys}"
+        )
+    pi0_model.paligemma_with_expert.paligemma.tie_weights()
+    # The action expert consumes embeddings and never produces vocabulary
+    # logits. Its JAX checkpoint therefore has no lm_head; do not serialize the
+    # randomly initialized PyTorch-only head.
+    pi0_model.paligemma_with_expert.gemma_expert.lm_head = None
+    meta_parameters = [
+        name for name, parameter in pi0_model.named_parameters() if parameter.is_meta
+    ]
+    if meta_parameters:
+        raise RuntimeError(f"model still has meta parameters: {meta_parameters}")
 
     # Save the converted model using safetensors
     os.makedirs(output_path, exist_ok=True)
@@ -649,13 +676,29 @@ def convert_pi0_checkpoint(
         pi0_model, os.path.join(output_path, "model.safetensors")
     )
 
-    # Copy assets folder if it exists
-    assets_source = pathlib.Path(checkpoint_dir).parent / "assets"
+    # OpenPI checkpoints in the wild use both ``<step>/assets`` and
+    # ``<run>/assets`` layouts. Prefer the step-local assets when present.
+    checkpoint_path = pathlib.Path(checkpoint_dir)
+    local_assets = checkpoint_path / "assets"
+    parent_assets = checkpoint_path.parent / "assets"
+    assets_source = local_assets if local_assets.exists() else parent_assets
     if assets_source.exists():
         assets_dest = pathlib.Path(output_path) / "assets"
         if assets_dest.exists():
             shutil.rmtree(assets_dest)
         shutil.copytree(assets_source, assets_dest)
+
+    if norm_stats_path is not None:
+        if not asset_id:
+            raise ValueError("asset_id is required when norm_stats_path is set")
+        norm_stats_source = pathlib.Path(norm_stats_path)
+        if not norm_stats_source.is_file():
+            raise FileNotFoundError(norm_stats_source)
+        norm_stats_dest = (
+            pathlib.Path(output_path) / "assets" / asset_id / "norm_stats.json"
+        )
+        norm_stats_dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(norm_stats_source, norm_stats_dest)
 
     # Save config as JSON for reference
     config_dict = {
@@ -674,21 +717,36 @@ def convert_pi0_checkpoint(
 
 def main(
     checkpoint_dir: str,
-    config_name: str,
+    config_name: str | None = None,
     output_path: str | None = None,
     precision: Literal["float32", "bfloat16", "float16"] = "bfloat16",
+    action_horizon: int = 50,
+    norm_stats_path: str | None = None,
+    asset_id: str | None = None,
     *,
+    pi05: bool = False,
     inspect_only: bool = False,
 ):
-    """Load JAX model and optionally convert to PyTorch.
+    """Load a JAX model and optionally convert it to PyTorch.
 
     Args:
-        checkpoint_dir: Path to the JAX checkpoint directory
-        output_path: Path to save converted PyTorch model (required for conversion)
-        precision: Precision for model conversion
-        inspect_only: Only inspect parameter keys, don't convert
+        checkpoint_dir: Path to the JAX checkpoint directory.
+        config_name: OpenPI training config used to determine model dimensions.
+        output_path: Path to save converted PyTorch model (required for conversion).
+        precision: Precision for model conversion.
+        action_horizon: Action horizon for the built-in Pi0.5 model config.
+        norm_stats_path: Optional norm stats file to package with the model.
+        asset_id: Asset directory name for ``norm_stats_path``.
+        pi05: Use a built-in Pi0.5 config instead of a private OpenPI config.
+        inspect_only: Only inspect parameter keys; do not convert.
     """
-    model_config = _config.get_config(config_name).model
+    if pi05 == (config_name is not None):
+        raise ValueError("set exactly one of pi05=True or config_name")
+    model_config = (
+        openpi.models.pi0_config.Pi0Config(pi05=True, action_horizon=action_horizon)
+        if pi05
+        else _config.get_config(config_name).model
+    )
     if not isinstance(model_config, openpi.models.pi0_config.Pi0Config):
         raise ValueError(f"Config {config_name} is not a Pi0Config")
     if inspect_only:
@@ -699,7 +757,14 @@ def main(
                 "Error: --output_path is required for conversion. Use --inspect_only to only view keys."
             )
             return
-        convert_pi0_checkpoint(checkpoint_dir, precision, output_path, model_config)
+        convert_pi0_checkpoint(
+            checkpoint_dir,
+            precision,
+            output_path,
+            model_config,
+            norm_stats_path=norm_stats_path,
+            asset_id=asset_id,
+        )
 
 
 if __name__ == "__main__":
