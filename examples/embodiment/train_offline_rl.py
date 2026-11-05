@@ -53,10 +53,18 @@ def main(cfg) -> None:
         from rlinf.workers.actor.fsdp_iql_policy_worker import EmbodiedIQLFSDPPolicy
 
         actor_worker_cls = EmbodiedIQLFSDPPolicy
+    elif cfg.algorithm.loss_type == "rlt_ac":
+        if not bool(cfg.runner.get("actor_only", False)):
+            raise ValueError("Offline rlt_ac requires runner.actor_only=true.")
+        if cfg.runner.val_check_interval > 0 or cfg.runner.only_eval:
+            raise ValueError("Actor-only RLT warmup does not support evaluation.")
+        from rlinf.workers.actor.fsdp_rlt_ac_policy_worker import RLTACFSDPPolicy
+
+        actor_worker_cls = RLTACFSDPPolicy
     else:
         raise NotImplementedError(
             f"Unsupported offline algorithm.loss_type={cfg.algorithm.loss_type!r}. "
-            "Current train_offline_rl entry only supports 'offline_iql'."
+            "Supported values are 'offline_iql' and 'rlt_ac'."
         )
     actor_group = actor_worker_cls.create_group(cfg).launch(
         cluster, name=cfg.actor.group_name, placement_strategy=actor_placement

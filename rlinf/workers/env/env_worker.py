@@ -32,6 +32,7 @@ from rlinf.data.embodied_io_struct import (
     Trajectory,
     convert_trajectories_to_batch,
 )
+from rlinf.data.raw_rollout_archive import RawRolloutArchive
 from rlinf.envs import get_env_cls
 from rlinf.envs.action_utils import prepare_actions
 from rlinf.envs.utils import get_env_attr
@@ -63,12 +64,15 @@ class EnvWorker(Worker):
         self.train_video_cnt = 0
         self.eval_video_cnt = 0
         self.should_stop = False
+        self.raw_rollout_archive: RawRolloutArchive | None = None
+        self.raw_rollout_runner_step = 0
 
         self.env_list = []
         self.eval_env_list = []
 
         self.last_obs_list = []
         self.last_intervened_info_list = []
+        self.last_rlt_switch_flags_list = []
         self._prefetched_train_bootstrap: list[EnvOutput] | None = None
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
 
@@ -78,6 +82,22 @@ class EnvWorker(Worker):
         self.enable_rlt = (
             OmegaConf.select(self.cfg, "algorithm.loss_type", default="") == "rlt_ac"
         )
+        self.rlt_skip_noncritical_trajectory = bool(
+            self.cfg.rollout.get("rlt_skip_noncritical_trajectory", False)
+        )
+        prefetch_cfg = self.cfg.rollout.get("chunk_async_prefetch", {}) or {}
+        self.chunk_async_prefetch = bool(prefetch_cfg.get("enable", False))
+        self.chunk_prefetch_steps_before_end = int(
+            prefetch_cfg.get("steps_before_end", 1)
+        )
+        self.chunk_prefetch_noncritical_only = bool(
+            prefetch_cfg.get("noncritical_only", True)
+        )
+        if self.chunk_async_prefetch:
+            if self.chunk_prefetch_steps_before_end < 1:
+                raise ValueError("chunk_async_prefetch.steps_before_end must be >= 1")
+            if not self.enable_rlt:
+                raise ValueError("chunk_async_prefetch currently requires RLT AC")
 
         self.reward_mode = self.cfg.get("reward", {}).get("reward_mode", "per_step")
         self.history_reward_assign = self.cfg.get("reward", {}).get(
@@ -256,6 +276,122 @@ class EnvWorker(Worker):
                 self.history_lengths = [{} for _ in range(self.stage_num)]
 
         self._init_env()
+        self._init_raw_rollout_archive()
+
+    def _init_raw_rollout_archive(self) -> None:
+        archive_cfg = OmegaConf.select(
+            self.cfg, "algorithm.raw_rollout_archive", default=None
+        )
+        if not self.enable_train or not archive_cfg or not archive_cfg.get(
+            "enabled", False
+        ):
+            return
+        archive_path = str(archive_cfg.path)
+        manifest = {
+            "rank": self._rank,
+            "camera_layout": {
+                "main_images": ["top"],
+                "extra_view_images": ["wrist_L", "wrist_R"],
+            },
+            "action_space": OmegaConf.select(
+                self.cfg,
+                "rollout.rlt_feature_model.openpi.rlt_action_space",
+                default=None,
+            ),
+            "action_dim": int(self.model_cfg.action_dim),
+            "executed_chunk_length": int(self.model_cfg.num_action_chunks),
+            "stage1_model_path": OmegaConf.select(
+                self.cfg, "rollout.rlt_feature_model.model_path", default=None
+            ),
+            "norm_stats_path": OmegaConf.select(
+                self.cfg,
+                "rollout.rlt_feature_model.openpi_data.norm_stats_path",
+                default=None,
+            ),
+            "rtc_enabled": bool(
+                OmegaConf.select(
+                    self.cfg,
+                    "rollout.rlt_feature_model.openpi.rtc_enabled",
+                    default=False,
+                )
+            ),
+        }
+        self.raw_rollout_archive = RawRolloutArchive(
+            f"{archive_path}/rank_{self._rank}",
+            manifest=manifest,
+            jpeg_quality=int(archive_cfg.get("jpeg_quality", 90)),
+            queue_size=int(archive_cfg.get("queue_size", 64)),
+        )
+
+    def _archive_raw_rollout_chunk(
+        self,
+        *,
+        policy_input_obs: dict[str, Any],
+        chunk_start_obs: dict[str, Any],
+        next_output: EnvOutput,
+        rollout_result: RolloutResult,
+        rewards: torch.Tensor | None,
+        rollout_epoch: int,
+        chunk_step: int,
+        stage_id: int,
+    ) -> None:
+        if getattr(self, "raw_rollout_archive", None) is None:
+            return
+        forward = rollout_result.forward_inputs
+        observations = {
+            "policy_input": policy_input_obs,
+            "chunk_start": chunk_start_obs,
+            "next": next_output.obs,
+        }
+        if next_output.final_obs is not None:
+            observations["final"] = next_output.final_obs
+        self.raw_rollout_archive.submit(
+            {
+                "runner_step": self.raw_rollout_runner_step,
+                "rollout_epoch": rollout_epoch,
+                "chunk_step": chunk_step,
+                "stage_id": stage_id,
+                "observations": observations,
+                "actions": {
+                    # Full, pre-output-transform Pi0.5 prediction (normally 50 steps).
+                    "pi05_model_output": forward.get("pi05_model_output"),
+                    # Post-transform and RTC-prefix-selected reference actually used.
+                    "pi05_reference": forward.get("ref_chunk"),
+                    "rlt_actor_raw": forward.get("model_action"),
+                    "routed": rollout_result.actions,
+                    "executed": next_output.executed_actions,
+                    "intervention": next_output.intervene_actions,
+                },
+                "flags": {
+                    "rl_phase_requested": forward.get("record_transition"),
+                    "rlt_actor_active": forward.get("actor_switch"),
+                    "rlt_switch_during_execution": next_output.rlt_switch_flags,
+                    "intervention": next_output.intervene_flags,
+                },
+                "outcome": {
+                    "rewards": rewards,
+                    "env_rewards": next_output.rewards,
+                    "terminations": next_output.terminations,
+                    "truncations": next_output.truncations,
+                    "dones": next_output.dones,
+                },
+                "rtc": {
+                    key: forward.get(key)
+                    for key in (
+                        "rtc_chunk_id",
+                        "rtc_action_start",
+                        "rtc_delay_steps",
+                        "rtc_inference_ms",
+                        "rtc_guidance_applied",
+                    )
+                },
+                "versions": rollout_result.versions,
+                "env_infos": next_output.env_infos,
+            }
+        )
+        # The 50-step tensor is only for the raw archive. Do not let it inflate
+        # the encoded training trajectory sent to the actor worker.
+        forward.pop("pi05_model_output", None)
 
     def update_env_cfg(self):
         if self.enable_train:
@@ -423,6 +559,7 @@ class EnvWorker(Worker):
                     extracted_obs, _ = self.env_list[i].reset()
                     self.last_obs_list.append(extracted_obs)
                     self.last_intervened_info_list.append((None, None))
+                    self.last_rlt_switch_flags_list.append(None)
                 if self.train_enable_offload and self.cfg.env.train.get(
                     "enable_init_offload", True
                 ):
@@ -433,7 +570,11 @@ class EnvWorker(Worker):
 
     @Worker.timer("env_interact_step")
     def env_interact_step(
-        self, chunk_actions: torch.Tensor, stage_id: int
+        self,
+        chunk_actions: torch.Tensor,
+        stage_id: int,
+        *,
+        step_callback=None,
     ) -> tuple[EnvOutput, dict[str, Any], dict[str, Any]]:
         """
         This function is used to interact with the environment.
@@ -456,8 +597,11 @@ class EnvWorker(Worker):
             chunk_actions = exec_actions
         env_info = {}
 
+        chunk_step_kwargs = (
+            {"step_callback": step_callback} if step_callback is not None else {}
+        )
         obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
-            self.env_list[stage_id].chunk_step(chunk_actions)
+            self.env_list[stage_id].chunk_step(chunk_actions, **chunk_step_kwargs)
         )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
@@ -925,6 +1069,7 @@ class EnvWorker(Worker):
                     truncations=truncations,
                     intervene_actions=self.last_intervened_info_list[stage_id][0],
                     intervene_flags=self.last_intervened_info_list[stage_id][1],
+                    rlt_switch_flags=self.last_rlt_switch_flags_list[stage_id],
                 )
                 env_outputs.append(env_output)
 
@@ -986,19 +1131,51 @@ class EnvWorker(Worker):
             (env_output.intervene_actions, env_output.intervene_flags)
             for env_output in env_output_list
         ]
+        self.last_rlt_switch_flags_list = [
+            env_output.rlt_switch_flags for env_output in env_output_list
+        ]
 
     @Worker.timer("env/send_rollout_trajectories")
     async def send_rollout_trajectories(
         self, rollout_result: EmbodiedRolloutResult, channel: Channel
     ):
-        trajectories: list[Trajectory] = rollout_result.to_splited_trajectories(
-            self.actor_split_num
+        skip_payload = (
+            self.enable_rlt
+            and getattr(self, "rlt_skip_noncritical_trajectory", False)
+            and not self._has_recorded_rlt_transition(rollout_result)
         )
+        if skip_payload:
+            trajectories = [
+                Trajectory(max_episode_length=rollout_result.max_episode_length)
+                for _ in range(self.actor_split_num)
+            ]
+        else:
+            trajectories = rollout_result.to_splited_trajectories(
+                self.actor_split_num
+            )
         rollout_result.clear()
         for trajectory in trajectories:
             channel.put(trajectory, async_op=True)
         del trajectories
         gc.collect()
+
+    @staticmethod
+    def _has_recorded_rlt_transition(
+        rollout_result: EmbodiedRolloutResult,
+    ) -> bool:
+        for forward_inputs in rollout_result.forward_inputs:
+            record = forward_inputs.get("record_transition")
+            if isinstance(record, torch.Tensor) and bool(record.to(torch.bool).any()):
+                return True
+        return False
+
+    @staticmethod
+    def _rlt_phase_is_critical(flags: torch.Tensor | None) -> bool:
+        return bool(
+            isinstance(flags, torch.Tensor)
+            and flags.numel() > 0
+            and flags.to(torch.bool).reshape(flags.shape[0], -1)[:, -1].any()
+        )
 
     @Worker.timer("env/send_lerobot_episodes")
     async def send_lerobot_episodes(
@@ -1041,6 +1218,8 @@ class EnvWorker(Worker):
                 self._prefetched_train_bootstrap = None
             else:
                 env_outputs = self._bootstrap_and_send_train(rollout_channel)
+            policy_input_obs = [env_output.obs for env_output in env_outputs]
+            next_policy_input_obs = list(policy_input_obs)
 
             for chunk_step_idx in range(self.n_train_chunk_steps):
                 for stage_id in range(self.stage_num):
@@ -1125,10 +1304,73 @@ class EnvWorker(Worker):
                             self.rollout_results,
                             rollout_result,
                             cache_current=True,
+                            intervene_actions=env_output.intervene_actions,
+                            intervene_flags=env_output.intervene_flags,
+                        )
+
+                    prefetch_sent = False
+                    can_prefetch = getattr(self, "chunk_async_prefetch", False) and (
+                        not self.chunk_prefetch_noncritical_only
+                        or not self._rlt_phase_is_critical(
+                            env_output.rlt_switch_flags
+                        )
+                    )
+
+                    def prefetch_next_chunk(
+                        step_idx, chunk_size, extracted_obs, infos
+                    ):
+                        nonlocal prefetch_sent
+                        trigger_idx = max(
+                            0,
+                            chunk_size - self.chunk_prefetch_steps_before_end - 1,
+                        )
+                        if not can_prefetch or prefetch_sent or step_idx != trigger_idx:
+                            return
+                        if self.chunk_prefetch_noncritical_only and self._rlt_phase_is_critical(
+                            infos.get("rlt_switch_flags", None)
+                        ):
+                            return
+                        self.send_to(
+                            group_name=self.cfg.rollout.group_name,
+                            channel=rollout_channel,
+                            data=self._build_rollout_input_data(
+                                {
+                                    "obs": clone_nested_to_cpu(extracted_obs),
+                                    "final_obs": None,
+                                    "rlt_switch_flags": infos.get(
+                                        "rlt_switch_flags", None
+                                    ),
+                                    "intervene_flags": infos.get(
+                                        "intervene_flag", None
+                                    ),
+                                }
+                            ),
+                            mode="train",
+                            tag="rollout_results",
+                            route_key=(
+                                stage_id if not self.env_decoupled_mode else None
+                            ),
+                            decoupled_mode=self.env_decoupled_mode,
+                        )
+                        prefetch_sent = True
+                        next_policy_input_obs[stage_id] = clone_nested_to_cpu(
+                            extracted_obs
                         )
 
                     env_output, env_info, chunk_step_payload = self.env_interact_step(
-                        rollout_result.actions, stage_id
+                        rollout_result.actions,
+                        stage_id,
+                        step_callback=(prefetch_next_chunk if can_prefetch else None),
+                    )
+                    self._archive_raw_rollout_chunk(
+                        policy_input_obs=policy_input_obs[stage_id],
+                        chunk_start_obs=curr_obs,
+                        next_output=env_output,
+                        rollout_result=rollout_result,
+                        rewards=rewards,
+                        rollout_epoch=epoch,
+                        chunk_step=chunk_step_idx,
+                        stage_id=stage_id,
                     )
                     stage_rollout = self.rollout_results[stage_id]
                     if isinstance(stage_rollout, EmbodiedLerobotRolloutResult):
@@ -1136,16 +1378,20 @@ class EnvWorker(Worker):
                             rollout_result=rollout_result,
                             **chunk_step_payload,
                         )
-                    env_batch = env_output.to_dict()
-                    self.send_to(
-                        group_name=self.cfg.rollout.group_name,
-                        channel=rollout_channel,
-                        data=self._build_rollout_input_data(env_batch),
-                        mode="train",
-                        tag="rollout_results",
-                        route_key=stage_id if not self.env_decoupled_mode else None,
-                        decoupled_mode=self.env_decoupled_mode,
-                    )
+                    if not prefetch_sent:
+                        env_batch = env_output.to_dict()
+                        self.send_to(
+                            group_name=self.cfg.rollout.group_name,
+                            channel=rollout_channel,
+                            data=self._build_rollout_input_data(env_batch),
+                            mode="train",
+                            tag="rollout_results",
+                            route_key=(
+                                stage_id if not self.env_decoupled_mode else None
+                            ),
+                            decoupled_mode=self.env_decoupled_mode,
+                        )
+                        next_policy_input_obs[stage_id] = env_output.obs
                     if self.collect_transitions and not self.enable_rlt:
                         next_obs = (
                             env_output.final_obs
@@ -1157,6 +1403,7 @@ class EnvWorker(Worker):
                         )
 
                     env_outputs[stage_id] = env_output
+                    policy_input_obs[stage_id] = next_policy_input_obs[stage_id]
                     should_record = (
                         self.cfg.env.train.auto_reset
                         or self.cfg.env.train.ignore_terminations
@@ -1235,6 +1482,8 @@ class EnvWorker(Worker):
                         self.rollout_results,
                         rollout_result,
                         cache_current=False,
+                        intervene_actions=env_output.intervene_actions,
+                        intervene_flags=env_output.intervene_flags,
                     )
 
             if self.use_training_pipeline and actor_channel is not None:
@@ -1247,6 +1496,11 @@ class EnvWorker(Worker):
 
             self.store_last_obs_and_intervened_info(env_outputs)
             self.finish_rollout()
+
+        raw_rollout_archive = getattr(self, "raw_rollout_archive", None)
+        if raw_rollout_archive is not None:
+            raw_rollout_archive.flush()
+            self.raw_rollout_runner_step += 1
 
         if not self.use_training_pipeline and actor_channel is not None:
             if self.enable_online_lerobot:

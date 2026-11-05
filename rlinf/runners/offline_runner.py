@@ -291,7 +291,13 @@ class OfflineRunner:
                     global_steps.append(int(rank_metrics.pop("__global_step")))
 
             if global_steps:
-                self.global_step = max(global_steps)
+                next_global_step = max(global_steps)
+                if next_global_step <= self.global_step:
+                    raise RuntimeError(
+                        "Offline actor made no training progress; verify that "
+                        "the configured replay/demo buffers meet their minimum sizes."
+                    )
+                self.global_step = next_global_step
                 worker_step_synced = True
             else:
                 self.global_step = next_step

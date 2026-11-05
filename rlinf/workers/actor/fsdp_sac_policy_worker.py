@@ -756,6 +756,42 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
         """
         return {}
 
+    def _save_training_state(self, save_base_path):
+        state_path = os.path.join(
+            save_base_path,
+            "sac_components/training_state",
+            f"checkpoint_rank_{self._rank}.pt",
+        )
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        state = {"update_step": int(self.update_step)}
+        if hasattr(self, "online_successful_episodes"):
+            state["online_successful_episodes"] = int(
+                self.online_successful_episodes
+            )
+        torch.save(state, state_path)
+
+    def _load_training_state(self, load_base_path):
+        state_path = os.path.join(
+            load_base_path,
+            "sac_components/training_state",
+            f"checkpoint_rank_{self._rank}.pt",
+        )
+        if not os.path.isfile(state_path):
+            self.logger.warning(
+                "SAC training state is absent in this legacy checkpoint; "
+                "update_step remains %s.",
+                self.update_step,
+            )
+            return False
+
+        state = torch.load(state_path, map_location="cpu", weights_only=True)
+        self.update_step = int(state["update_step"])
+        if hasattr(self, "online_successful_episodes"):
+            self.online_successful_episodes = int(
+                state.get("online_successful_episodes", 0)
+            )
+        return True
+
     def save_checkpoint(self, save_base_path, step):
         if self.is_weight_offloaded:
             self.load_param_and_grad(self.device)
@@ -800,6 +836,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             os.path.join(target_model_save_path, f"checkpoint_rank_{self._rank}.pt"),
         )
 
+        self._save_training_state(save_base_path)
+
         # save replay buffer
         buffer_save_path = os.path.join(
             save_base_path, f"sac_components/replay_buffer/rank_{self._rank}"
@@ -841,6 +879,8 @@ class EmbodiedSACFSDPPolicy(EmbodiedFSDPActor):
             cpu_offload=False,
             full_state_dict=True,
         )
+
+        self._load_training_state(load_base_path)
 
         # load replay buffer
         buffer_load_path = os.path.join(

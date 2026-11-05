@@ -1,0 +1,45 @@
+defaults:
+  - zadai_200_rlt_stage2_ac_mlp
+  - _self_
+
+# 439 Stage1 reference with synchronous/native OpenPI inference.
+runner:
+  logger:
+    experiment_name: zadai_439_rlt_stage2_ac_mlp_native
+
+algorithm:
+  # Formal Stage-2 RL baseline: keep the discount meaningful across a 30-step
+  # action chunk (0.99864**30 ~= 0.96), rather than discounting every low-level
+  # step with 0.96.
+  gamma: 0.99864
+  reference_dropout_prob: 0.2
+  actor_weight_schedule:
+    warmup_updates: 200
+    ramp_updates: 400
+  rlt_schedule:
+    warmup_min_size: 250
+    warmup_post_collect_updates: 200
+    train_every_transitions: 4
+    max_updates_per_train_step: 20
+  raw_rollout_archive:
+    path: ${oc.env:ZADAI_439_NATIVE_RAW_ROLLOUT_PATH,/home/xlb/data/replay_buffers/zadai_439_rlt_stage2_native_raw}
+  replay_buffer:
+    cache_size: 2000
+    sample_window_size: 2000
+    auto_save_path: ${oc.env:ZADAI_439_NATIVE_REPLAY_BUFFER_PATH,/home/xlb/data/replay_buffers/zadai_439_rlt_stage2_native}
+  demo_buffer:
+    load_path: ${oc.env:ZADAI_439_DEMO_BUFFER_PATH,/home/xlb/data/replay_buffers/zadai_9_16_joint_expert_38_439/rank_0}
+
+rollout:
+  rlt_skip_noncritical_trajectory: False
+  chunk_async_prefetch:
+    enable: False
+    steps_before_end: 10
+    noncritical_only: True
+  rlt_feature_model:
+    model_path: ${oc.env:ZADAI_439_STAGE1_CHECKPOINT,/home/xlb/data/models/zadai_439_rlt_stage1/global_step_20000}
+    openpi_data:
+      repo_id: zadai_joint_clean_439
+      norm_stats_path: ${oc.env:ZADAI_439_NORM_STATS_PATH,/home/xlb/data/models/zadai_439_rlt_stage1/assets/zadai_joint_clean_439/norm_stats.json}
+    openpi:
+      rtc_enabled: False

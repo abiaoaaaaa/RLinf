@@ -21,14 +21,14 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf-rlt
-    experiment_name: "zadai_200_rlt_stage2_ac_mlp"
+    experiment_name: "zadai_277_rlt_stage2_ac_mlp"
     logger_backends: ["tensorboard"]
   max_epochs: 8000
   max_steps: -1
   only_eval: False
   val_check_interval: -1
-  # One outer rollout is configured for at most 300 low-level steps.  At
-  # 30 Hz, 30 outer iterations are an initial ~5 minute checkpoint cadence;
+  # One outer rollout is configured for at most 900 low-level steps. At
+  # 30 Hz, 30 outer iterations are an initial ~15 minute checkpoint cadence;
   # this is step-based, not a strict wall-clock timer.
   save_interval: 30
   resume_dir: null
@@ -47,6 +47,16 @@ algorithm:
   q_weight: 0.1
   bc_weight: 5.0
   reference_dropout_prob: 0.5
+  # Start from reference imitation, then introduce the Q objective gradually
+  # after rollout control becomes eligible at update_step=100.
+  actor_weight_schedule:
+    enable: True
+    warmup_updates: 100
+    ramp_updates: 400
+    warmup_bc_weight: 5.0
+    warmup_q_weight: 0.0
+    online_bc_weight: 2.5
+    online_q_weight: 0.1
   # The Stage 2 actor still predicts a complete action chunk, but deployment
   # and Q-policy queries project its first action near OpenPI at handoff.
   # 0.02 normalized is about 0.063 rad for the 14 [-pi, pi] joints. Keep both
@@ -64,20 +74,35 @@ algorithm:
     # checkpoint output semantics and converts its absolute target to a
     # residual before tracking. Set to null to retain the old projection path.
     tracking_mode: absolute_compat
-    tracking_max_step_delta: [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
-                              0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
+    # 0.07 normalized is about 0.22 rad: no tighter than the dataset-calibrated
+    # physical step limit. The environment remains the final safety boundary.
+    tracking_max_step_delta: [0.07, 0.07, 0.07, 0.07, 0.07, 0.07, 0.07,
+                              0.07, 0.07, 0.07, 0.07, 0.07, 0.07, 0.07,
                               0.02, 0.02]
     residual_scale: 1.0
+    # Smooth only the actual OpenPI<->RLT mode edge. Continuous RLT chunks do
+    # not restart this handoff. The first step is anchored to measured joints
+    # and recursively limited before the physical environment sees it.
+    handoff:
+      enable: true
+      enter_steps: 10
+      exit_steps: 10
+      max_step_delta: [0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01,
+                       0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01,
+                       0.02, 0.02]
     # Offline validation on the latest non-intervened replay chunks reduced
     # mean joint acceleration from 20.6 to 2.6 rad/s^2. Smooth only the arm
     # residual; zero limits pin both grippers to the OpenPI reference.
     residual_smoothing:
       enable: True
-      max_abs_residual: [0.015, 0.015, 0.015, 0.015, 0.015, 0.015, 0.015,
-                         0.015, 0.015, 0.015, 0.015, 0.015, 0.015, 0.015,
+      # Permit meaningful Stage2 corrections around OpenPI: 0.10 normalized
+      # is about 0.314 rad on arm joints. Final commands are still constrained
+      # by the 0.22 rad/step and 3.00 rad/chunk physical limits.
+      max_abs_residual: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10,
+                         0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10,
                          0.0, 0.0]
-      max_residual_step: [0.003, 0.003, 0.003, 0.003, 0.003, 0.003, 0.003,
-                          0.003, 0.003, 0.003, 0.003, 0.003, 0.003, 0.003,
+      max_residual_step: [0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
+                          0.02, 0.02, 0.02, 0.02, 0.02, 0.02, 0.02,
                           0.0, 0.0]
       filter_kernel: [1.0, 2.0, 3.0, 2.0, 1.0]
       boundary_blend_steps: 10
@@ -100,10 +125,26 @@ algorithm:
     # next launch. The actor worker appends rank_0 below this base directory.
     auto_save: True
     auto_resume: True
-    auto_save_path: ${oc.env:ZADAI_REPLAY_BUFFER_PATH,/home/zzx23457/code_xlb/RLinf/replay_buffers/zadai_200_rlt_stage2}
-  # Online-only residual fine-tuning. Set this to a mapping only when an
-  # offline RLT demo buffer should be sampled as a second data source.
-  demo_buffer: null
+    auto_save_path: ${oc.env:ZADAI_277_REPLAY_BUFFER_PATH,/home/xlb/data/replay_buffers/zadai_277_rlt_stage2}
+  # Model-independent raw archive. Unlike replay_buffer, this retains images,
+  # robot state, Pi0.5/RLT/routed/executed actions and intervention labels for
+  # every chunk, including non-critical chunks. JPEG encoding and writes run
+  # on a background thread and are flushed at each runner-step boundary.
+  raw_rollout_archive:
+    enabled: True
+    path: ${oc.env:ZADAI_RAW_ROLLOUT_PATH,/home/xlb/data/replay_buffers/zadai_raw_rollout}
+    jpeg_quality: 90
+    queue_size: 64
+  # Thirty manually selected Joint demonstrations are materialized with the
+  # Stage1 encoder into a native RLinf replay directory. Training samples the
+  # online replay and this fixed expert buffer 50:50.
+  demo_buffer:
+    enable_cache: True
+    cache_size: 2000
+    min_buffer_size: 1
+    sample_window_size: 2000
+    load_path: ${oc.env:ZADAI_277_DEMO_BUFFER_PATH,/home/xlb/data/replay_buffers/zadai_9_16_joint_expert_30/rank_0}
+    auto_save: False
   target_update_freq: 1
   target_update_type: all
   train_actor_steps: 100
@@ -120,18 +161,18 @@ algorithm:
     # Keep the randomly initialized RLT head on the reference policy until it
     # has completed 100 replay updates (five outer steps at the cap below).
     warmup_post_collect_updates: 100
-    # Match the original RLinf real-world cadence after warmup: train once on
-    # every runner global step, even if that rollout added no critical data.
-    train_every_runner_step: True
+    # After warmup, schedule one update_epoch block for every four newly
+    # recorded critical chunks. No new replay data means no new updates.
+    train_every_runner_step: False
     train_every_episodes: 0
-    train_every_transitions: 0
+    train_every_transitions: 4
     max_updates_per_train_step: 20
 
 env:
   group_name: EnvGroup
   train:
     rollout_epoch: 1
-    max_steps_per_rollout_epoch: 300
+    max_steps_per_rollout_epoch: 900
   eval:
     rollout_epoch: 1
     max_steps_per_rollout_epoch: 100
@@ -145,6 +186,15 @@ rollout:
   pipeline_stage_num: 1
   collect_transitions: True
   collect_prev_infos: False
+  # Ordinary (non-critical) epochs send only an empty synchronization marker
+  # to the actor instead of serializing images/features that replay will drop.
+  rlt_skip_noncritical_trajectory: True
+  # Start the next reference-policy inference during the final ten 30 Hz
+  # controls of a non-critical chunk. Critical chunks stay fully synchronous.
+  chunk_async_prefetch:
+    enable: True
+    steps_before_end: 10
+    noncritical_only: True
   model:
     model_path: null
     precision: ${actor.model.precision}
@@ -155,17 +205,18 @@ rollout:
     model_type: openpi
     precision: null
     is_lora: False
-    model_path: ${oc.env:ZADAI_STAGE1_CHECKPOINT,/home/zzx23457/code_xlb/RLinf/logs/20260825-23:18:34-zadai_200_rlt_stage1_sft_openpi_pi05/zadai_200_rlt_stage1/checkpoints/global_step_7000/actor}
+    model_path: ${oc.env:ZADAI_439_STAGE1_CHECKPOINT,/home/xlb/data/models/zadai_439_rlt_stage1/global_step_20000}
     openpi_data:
-      repo_id: zadai_200
-      norm_stats_path: ${oc.env:ZADAI_NORM_STATS_PATH,/home/zzx23457/pi05_zadai_200_rlt_weight_data_20260825/model/checkpoint_149999/assets/zadai_200/norm_stats.json}
+      repo_id: zadai_joint_clean_439
+      norm_stats_path: ${oc.env:ZADAI_439_NORM_STATS_PATH,/home/xlb/data/models/zadai_439_rlt_stage1/assets/zadai_joint_clean_439/norm_stats.json}
     openpi:
-      config_name: pi05_hhw_tj_zadai_200_uniform
+      config_name: pi05_zadai_ybs_joint_277
       num_images_in_input: 3
       action_chunk: ${actor.model.ref_num_action_chunks}
       action_env_dim: 16
-      # Match native OpenPI pi0.5 inference (sample_actions default: 10).
+      # Keep native OpenPI pi0.5 inference quality; async prefetch hides it.
       num_steps: 10
+      rtc_enabled: True
       state_indices: []
       rlt_action_space: joint
       noise_method: flow_noise

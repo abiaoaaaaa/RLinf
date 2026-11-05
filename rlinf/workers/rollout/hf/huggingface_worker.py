@@ -81,6 +81,7 @@ class MultiStepRolloutWorker(Worker):
         self.expert_model = None
         self.rlt_feature_model = None
         self.rlt_route = None
+        self._rlt_rtc_model_actions: dict[int, torch.Tensor] = {}
 
         self.total_num_train_envs = (
             cfg.env.train.total_num_envs if self.enable_train else 0
@@ -559,6 +560,8 @@ class MultiStepRolloutWorker(Worker):
         final_obs: dict[str, Any] | None = None,
         rlt_switch_flags: torch.Tensor | None = None,
         intervene_requested: torch.Tensor | None = None,
+        rtc_context: Any | None = None,
+        rtc_action_start: int = 0,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         if self.rlt_feature_model is not None:
             return predict_rlt_actions(
@@ -572,6 +575,8 @@ class MultiStepRolloutWorker(Worker):
                 rlt_switch_flags=rlt_switch_flags,
                 intervene_requested=intervene_requested,
                 expert_model=self.expert_model,
+                rtc_context=rtc_context,
+                rtc_action_start=rtc_action_start,
             )
         return self.predict(env_obs, mode=mode)
 
@@ -672,6 +677,48 @@ class MultiStepRolloutWorker(Worker):
     @Worker.timer("generate_one_epoch")
     async def generate_one_epoch(self, input_channel: Channel, output_channel: Channel):
         self.update_dagger_beta()
+
+        def rtc_scalar(env_output, key, default):
+            value = env_output.get(key)
+            if value is None:
+                return default
+            return torch.as_tensor(value).reshape(-1)[0].item()
+
+        def add_rtc_forward_metadata(
+            result,
+            actions,
+            *,
+            chunk_id: int,
+            action_start: int,
+            delay_steps: int,
+            inference_ms: float,
+            guidance_applied: bool,
+        ) -> None:
+            """Keep every rollout row schema-identical, including bootstrap."""
+            batch_size = actions.shape[0]
+            result["forward_inputs"].update(
+                {
+                    "rtc_chunk_id": torch.full(
+                        (batch_size, 1), chunk_id, device=actions.device
+                    ),
+                    "rtc_action_start": torch.full(
+                        (batch_size, 1), action_start, device=actions.device
+                    ),
+                    "rtc_delay_steps": torch.full(
+                        (batch_size, 1), delay_steps, device=actions.device
+                    ),
+                    "rtc_inference_ms": torch.full(
+                        (batch_size, 1), inference_ms, device=actions.device
+                    ),
+                    "rtc_guidance_applied": torch.full(
+                        (batch_size, 1),
+                        guidance_applied,
+                        dtype=torch.bool,
+                        device=actions.device,
+                    ),
+                }
+            )
+
         for _ in range(self.n_train_chunk_steps):
             for stage_id in range(self.num_pipeline_stages):
                 env_output = await self.recv_from(
@@ -684,11 +731,59 @@ class MultiStepRolloutWorker(Worker):
                     merge_fn=self._merge_obs_batches,
                     infer_batch_size_fn=self._infer_env_batch_size,
                 ).async_wait()
+                rtc_enabled = bool(rtc_scalar(env_output, "rtc_enabled", False))
+                rtc_chunk_id = int(rtc_scalar(env_output, "rtc_chunk_id", 0))
+                rtc_executed_horizon = int(
+                    rtc_scalar(env_output, "rtc_executed_horizon", 0)
+                )
+                rtc_delay_steps = int(
+                    rtc_scalar(env_output, "rtc_delay_steps", 0)
+                )
+                rtc_action_start = int(
+                    rtc_scalar(env_output, "rtc_action_start", 0)
+                )
+                rtc_context = None
+                previous_model_actions = self._rlt_rtc_model_actions.get(stage_id)
+                if rtc_enabled and previous_model_actions is not None:
+                    from rlinf.models.embodiment.openpi.rtc_guidance import (
+                        RTCGuidanceContext,
+                    )
+
+                    rtc_context = RTCGuidanceContext(
+                        prev_model_actions=previous_model_actions,
+                        executed_horizon=rtc_executed_horizon,
+                        delay_steps=rtc_delay_steps,
+                    )
+
+                predict_started_at = time.perf_counter()
                 actions, result = self._predict_rollout_actions(
                     env_output["obs"],
                     final_obs=env_output.get("final_obs", None),
                     rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                     intervene_requested=env_output.get("intervene_flags", None),
+                    rtc_context=rtc_context,
+                    rtc_action_start=rtc_action_start,
+                )
+                inference_ms = (time.perf_counter() - predict_started_at) * 1000.0
+                rtc_model_actions = result.pop("rtc_model_actions", None)
+                if rtc_model_actions is not None:
+                    self._rlt_rtc_model_actions[stage_id] = rtc_model_actions.detach()
+                    if OmegaConf.select(
+                        self.cfg,
+                        "algorithm.raw_rollout_archive.enabled",
+                        default=False,
+                    ):
+                        result["forward_inputs"]["pi05_model_output"] = (
+                            rtc_model_actions.detach()
+                        )
+                add_rtc_forward_metadata(
+                    result,
+                    actions,
+                    chunk_id=rtc_chunk_id,
+                    action_start=rtc_action_start,
+                    delay_steps=rtc_delay_steps,
+                    inference_ms=inference_ms,
+                    guidance_applied=rtc_context is not None,
                 )
 
                 rollout_result = self._build_rollout_result(
@@ -717,11 +812,27 @@ class MultiStepRolloutWorker(Worker):
                 merge_fn=self._merge_obs_batches,
                 infer_batch_size_fn=self._infer_env_batch_size,
             ).async_wait()
+            rtc_chunk_id = int(rtc_scalar(env_output, "rtc_chunk_id", 0))
+            rtc_delay_steps = int(rtc_scalar(env_output, "rtc_delay_steps", 0))
+            rtc_action_start = int(rtc_scalar(env_output, "rtc_action_start", 0))
+            predict_started_at = time.perf_counter()
             actions, result = self._predict_rollout_actions(
                 env_output["obs"],
                 final_obs=env_output.get("final_obs", None),
                 rlt_switch_flags=env_output.get("rlt_switch_flags", None),
                 intervene_requested=env_output.get("intervene_flags", None),
+                rtc_action_start=rtc_action_start,
+            )
+            inference_ms = (time.perf_counter() - predict_started_at) * 1000.0
+            result.pop("rtc_model_actions", None)
+            add_rtc_forward_metadata(
+                result,
+                actions,
+                chunk_id=rtc_chunk_id,
+                action_start=rtc_action_start,
+                delay_steps=rtc_delay_steps,
+                inference_ms=inference_ms,
+                guidance_applied=False,
             )
 
             if self.enable_opd:
@@ -952,6 +1063,19 @@ class MultiStepRolloutWorker(Worker):
             "intervene_flags": self._merge_optional_flag_tensors(
                 obs_dicts, intervene_flags_list
             ),
+            **{
+                key: self._merge_optional_flag_tensors(
+                    obs_dicts,
+                    [obs_batch.get(key, None) for obs_batch in obs_batches],
+                )
+                for key in (
+                    "rtc_enabled",
+                    "rtc_chunk_id",
+                    "rtc_executed_horizon",
+                    "rtc_delay_steps",
+                    "rtc_action_start",
+                )
+            },
         }
 
     def _split_rollout_result(

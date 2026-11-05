@@ -102,19 +102,67 @@ def test_chunk_step_polls_state_without_posting_single_action(monkeypatch):
     assert env._submitted_chunk is None
 
 
-def test_action_chunk_limits_each_step_and_total_motion():
+def test_operator_go_home_holds_opens_waits_and_returns_fresh_observation(
+    monkeypatch,
+):
+    env = _make_env()
+    env.config.reset_wait_s = 5.0
+    obs = {"state": {"a_joint_position": np.zeros(14)}, "frames": {}}
+    sleeps = []
+    monkeypatch.setattr(env, "_state", lambda: (obs, {"fresh": True}))
+    monkeypatch.setattr(
+        "rlinf.envs.realworld.zadai.zadai_env.time.sleep", sleeps.append
+    )
+
+    returned_obs, info = env.operator_go_home()
+
+    assert [post[0].rsplit("/", 1)[-1] for post in env._session.posts] == [
+        "hold",
+        "action",
+        "go_home",
+    ]
+    assert env._session.posts[1][1] == {
+        "gripper_left": 0.0,
+        "gripper_right": 0.0,
+    }
+    assert sleeps == [5.0]
+    assert returned_obs is obs
+    assert info["fresh"]
+    assert info["operator_go_home"]
+
+
+def test_action_chunk_limits_each_step_and_total_motion(monkeypatch):
     env = _make_env()
     env.config.enforce_action_delta_limit = True
     env.config.max_action_delta = [0.10] * 14 + [None, None]
     env.config.enforce_chunk_action_delta_limit = True
-    env.config.max_chunk_action_delta = [0.50] * 14 + [None, None]
+    env.config.max_chunk_action_delta = [1.00] * 14 + [None, None]
+    runtime_events = []
+    monkeypatch.setattr(
+        "rlinf.envs.realworld.zadai.zadai_env.append_runtime_event",
+        lambda path, event: runtime_events.append(event),
+    )
 
     env.begin_action_chunk(np.ones((30, 16), dtype=np.float32))
 
     sent = np.stack([step["physical_action"] for step in env._submitted_chunk])
-    assert np.max(np.abs(sent[:, :14])) <= 0.50 + 1e-6
+    assert np.max(np.abs(sent[:, :14])) <= 1.00 + 1e-6
     assert np.max(np.abs(np.diff(sent[:, :14], axis=0))) <= 0.10 + 1e-6
     assert np.max(np.abs(sent[0, :14])) <= 0.10 + 1e-6
+
+    event = runtime_events[-1]
+    assert event["event"] == "action_chunk_submit"
+    assert event["safety_clip_step_count"] == 30
+    assert event["safety_clip_step_fraction"] == 1.0
+    np.testing.assert_array_equal(event["safety_clip_count_per_dim"][:14], 30)
+    np.testing.assert_allclose(
+        event["max_sent_step_delta_per_dim"][:14], 0.10, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        event["max_sent_chunk_delta_per_dim"][:14], 1.00, atol=1e-6
+    )
+    assert event["max_sent_step_delta"] <= 1.0
+    assert event["max_sent_chunk_delta"] <= 1.0 + 1e-6
 
 
 def test_eef_action_payload_uses_absolute_xyz_xyzw_targets():

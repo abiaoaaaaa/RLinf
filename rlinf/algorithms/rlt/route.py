@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -21,6 +22,7 @@ import torch.nn.functional as F
 
 from rlinf.algorithms.rlt.expert import predict_expert_actions
 from rlinf.algorithms.rlt.transition import use_simulator_transition_replay
+from rlinf.utils.runtime_log import append_runtime_event
 
 
 @dataclass(kw_only=True)
@@ -269,6 +271,62 @@ def apply_reference_residual_smoothing(
     )
 
 
+def apply_handoff_blend(
+    reference_actions: torch.Tensor,
+    actor_actions: torch.Tensor,
+    current_actions: torch.Tensor,
+    enter_mask: torch.Tensor,
+    exit_mask: torch.Tensor,
+    *,
+    enter_steps: int,
+    exit_steps: int,
+    max_step_delta: float | list[float] | tuple[float, ...],
+    pinned_dims: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Blend only on OpenPI/RLT edges, anchored at measured current joints."""
+    if not enter_mask.any() and not exit_mask.any():
+        return actor_actions
+    _, chunk_len, action_dim = actor_actions.shape
+    current = current_actions[:, None, :].to(
+        device=actor_actions.device, dtype=actor_actions.dtype
+    )
+    if pinned_dims is not None:
+        pinned = pinned_dims.to(device=actor_actions.device, dtype=torch.bool)
+        current = torch.where(pinned.view(1, 1, -1), reference_actions[:, :1], current)
+    max_delta = torch.as_tensor(
+        max_step_delta, device=actor_actions.device, dtype=actor_actions.dtype
+    )
+    if max_delta.numel() == 1:
+        max_delta = max_delta.expand(action_dim)
+    if max_delta.numel() != action_dim or (max_delta < 0).any():
+        raise ValueError("handoff max_step_delta must match action_dim")
+
+    result = torch.where(enter_mask[:, None, None], actor_actions, reference_actions)
+    active = enter_mask | exit_mask
+    max_steps = max(1, int(max(enter_steps, exit_steps)))
+    previous = current[:, 0]
+    # Include one extra sample at the end of the blend so the transition from
+    # the blended prefix to the normal chunk is also step-limited.
+    for step in range(min(chunk_len, max_steps + 1)):
+        if step == 0:
+            target = current[:, 0]
+        else:
+            enter_alpha = min(1.0, step / max(1, enter_steps - 1))
+            exit_alpha = min(1.0, step / max(1, exit_steps - 1))
+            enter_target = reference_actions[:, step] + enter_alpha * (
+                actor_actions[:, step] - reference_actions[:, step]
+            )
+            exit_target = current[:, 0] + exit_alpha * (
+                reference_actions[:, step] - current[:, 0]
+            )
+            target = torch.where(enter_mask[:, None], enter_target, exit_target)
+        target = previous + (target - previous).clamp(-max_delta, max_delta)
+        target = torch.where(active[:, None], target, result[:, step])
+        result[:, step] = target
+        previous = target
+    return result.clamp(-1.0, 1.0)
+
+
 def project_actions_to_reference(
     actions: torch.Tensor,
     ref_actions: torch.Tensor,
@@ -357,6 +415,10 @@ class RealworldRLTRoute(RLTRoute):
         reference_tracking_max_step_delta: float | list[float] | None = None,
         reference_tracking_residual_scale: float | list[float] = 1.0,
         reference_residual_smoothing: Any | None = None,
+        handoff_enable: bool = True,
+        handoff_enter_steps: int = 10,
+        handoff_exit_steps: int = 10,
+        handoff_max_step_delta: float | list[float] | None = None,
     ):
         self.use_schedule = use_schedule
         self.warmup_updates = warmup_updates
@@ -367,11 +429,25 @@ class RealworldRLTRoute(RLTRoute):
         self.reference_tracking_max_step_delta = reference_tracking_max_step_delta
         self.reference_tracking_residual_scale = reference_tracking_residual_scale
         self.reference_residual_smoothing = reference_residual_smoothing
+        self.handoff_enable = bool(handoff_enable)
+        self.handoff_enter_steps = max(1, int(handoff_enter_steps))
+        self.handoff_exit_steps = max(1, int(handoff_exit_steps))
+        self.handoff_max_step_delta = handoff_max_step_delta
+        self._route_sequence = 0
+        self._previous_routed_last: torch.Tensor | None = None
+        self._previous_actor_switch: torch.Tensor | None = None
+
+    @staticmethod
+    def _route_log_tensor(value: torch.Tensor | None):
+        if value is None or not torch.is_tensor(value):
+            return None
+        return value.detach().float().cpu().tolist()
 
     def _ready_for_online(self, version: int) -> bool:
         return not self.use_schedule or int(version) >= self.warmup_updates
 
     def route(self, ctx: RLTRouteContext) -> RLTRouteOutput:
+        self._route_sequence += 1
         actions = ctx.student_actions
         result = ctx.result
         critical_phase = _last_info_bool(
@@ -385,6 +461,11 @@ class RealworldRLTRoute(RLTRoute):
             self._ready_for_online(ctx.version),
         )
         actor_switch = critical_phase & learner_ready
+        previous_actor_switch = self._previous_actor_switch
+        if previous_actor_switch is None or previous_actor_switch.shape != actor_switch.shape:
+            previous_actor_switch = torch.zeros_like(actor_switch)
+        enter_handoff = actor_switch & ~previous_actor_switch
+        exit_handoff = ~actor_switch & previous_actor_switch
         ref_actions = result["forward_inputs"]["ref_chunk"].to(
             device=actions.device, dtype=actions.dtype
         )
@@ -411,11 +492,47 @@ class RealworldRLTRoute(RLTRoute):
                 max_step_delta=self.reference_tracking_max_step_delta,
                 residual_scale=self.reference_tracking_residual_scale,
             )
-            constrained_actor_actions = apply_reference_residual_smoothing(
-                constrained_actor_actions,
-                ref_actions[:, : actions.shape[1], : actions.shape[2]],
-                self.reference_residual_smoothing,
-            )
+        constrained_actor_actions = apply_reference_residual_smoothing(
+            constrained_actor_actions,
+            ref_actions[:, : actions.shape[1], : actions.shape[2]],
+            self.reference_residual_smoothing,
+        )
+        # Tracking/smoothing can move the constrained action again; reapply
+        # the explicit reference bound last.
+        constrained_actor_actions = project_actions_to_reference(
+            constrained_actor_actions,
+            ref_actions[:, : actions.shape[1], : actions.shape[2]],
+            self.actor_reference_max_delta,
+            self.actor_reference_constrained_steps,
+            self.actor_action_space,
+        )
+        if self.handoff_enable and self.actor_action_space == "joint":
+            current = ctx.rlt_obs.get("proprio")
+            if current is not None and self.handoff_max_step_delta is not None:
+                from rlinf.envs.realworld.zadai.action_codec import absolute_to_policy
+
+                current = absolute_to_policy(current, "joint")
+                pinned_dims = None
+                if self.actor_reference_max_delta is not None:
+                    pinned_dims = (
+                        torch.as_tensor(
+                            self.actor_reference_max_delta,
+                            device=actions.device,
+                            dtype=torch.bool,
+                        )
+                        == 0
+                    )
+                constrained_actor_actions = apply_handoff_blend(
+                    ref_actions[:, : actions.shape[1], : actions.shape[2]],
+                    constrained_actor_actions,
+                    current,
+                    enter_handoff,
+                    exit_handoff,
+                    enter_steps=self.handoff_enter_steps,
+                    exit_steps=self.handoff_exit_steps,
+                    max_step_delta=self.handoff_max_step_delta,
+                    pinned_dims=pinned_dims,
+                )
         routed_actions = torch.where(
             actor_switch[:, None, None],
             constrained_actor_actions,
@@ -426,6 +543,60 @@ class RealworldRLTRoute(RLTRoute):
         ).contiguous()
         result["forward_inputs"]["record_transition"] = critical_phase[:, None]
         result["forward_inputs"]["actor_switch"] = actor_switch[:, None]
+        # Keep a compact, human-readable handoff trace in the same JSONL file
+        # as the environment diagnostics.  Full chunks remain in raw archive;
+        # this log focuses on the values needed to diagnose switching jumps.
+        route_log_path = os.environ.get("ZADAI_RLT_ROUTE_LOG") or os.environ.get(
+            "ZADAI_RLT_RUNTIME_LOG"
+        )
+        if route_log_path:
+            ref_first = ref_actions[:, 0]
+            actor_first = constrained_actor_actions[:, 0]
+            routed_first = routed_actions[:, 0]
+            current = ctx.rlt_obs.get("proprio")
+            previous_last = self._previous_routed_last
+            if previous_last is not None and previous_last.shape != routed_first.shape:
+                previous_last = None
+            append_runtime_event(
+                route_log_path,
+                {
+                    "event": "rlt_route_action",
+                    "route_sequence": self._route_sequence,
+                    "version": int(ctx.version),
+                    "actor_switch": actor_switch,
+                    "critical_phase": critical_phase,
+                    "previous_actor_switch": previous_actor_switch,
+                    "enter_handoff": enter_handoff,
+                    "exit_handoff": exit_handoff,
+                    "handoff_enter_steps": self.handoff_enter_steps,
+                    "handoff_exit_steps": self.handoff_exit_steps,
+                    "handoff_max_step_delta": self.handoff_max_step_delta,
+                    "current_proprio_normalized": self._route_log_tensor(current),
+                    "actor_raw_first": self._route_log_tensor(actions[:, 0]),
+                    "actor_constrained_first": self._route_log_tensor(actor_first),
+                    "reference_first": self._route_log_tensor(ref_first),
+                    "routed_first": self._route_log_tensor(routed_first),
+                    "routed_last": self._route_log_tensor(routed_actions[:, -1]),
+                    "previous_routed_last": self._route_log_tensor(previous_last),
+                    "previous_to_routed_first_max": (
+                        torch.amax(torch.abs(routed_first - previous_last), dim=-1)
+                        if previous_last is not None
+                        else None
+                    ),
+                    "actor_minus_reference_first_max": torch.max(
+                        torch.abs(actor_first - ref_first), dim=-1
+                    ).values,
+                    "routed_minus_reference_first_max": torch.max(
+                        torch.abs(routed_first - ref_first), dim=-1
+                    ).values,
+                    "routed_chunk_max_abs": torch.amax(
+                        torch.abs(routed_actions), dim=(-2, -1)
+                    ),
+                    "switch_flags": self._route_log_tensor(ctx.rlt_switch_flags),
+                },
+            )
+        self._previous_routed_last = routed_actions[:, -1].detach()
+        self._previous_actor_switch = actor_switch.detach().clone()
         return RLTRouteOutput(actions=routed_actions, result=result)
 
 
@@ -552,5 +723,12 @@ def build_rlt_route(cfg: Any) -> RLTRoute:
     )
     route_kwargs["reference_residual_smoothing"] = constraint_cfg.get(
         "residual_smoothing", None
+    )
+    handoff_cfg = constraint_cfg.get("handoff", {}) or {}
+    route_kwargs["handoff_enable"] = bool(handoff_cfg.get("enable", True))
+    route_kwargs["handoff_enter_steps"] = int(handoff_cfg.get("enter_steps", 10))
+    route_kwargs["handoff_exit_steps"] = int(handoff_cfg.get("exit_steps", 10))
+    route_kwargs["handoff_max_step_delta"] = handoff_cfg.get(
+        "max_step_delta", None
     )
     return RealworldRLTRoute(**route_kwargs)

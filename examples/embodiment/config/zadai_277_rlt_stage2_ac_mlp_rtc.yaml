@@ -1,0 +1,30 @@
+defaults:
+  - zadai_200_rlt_stage2_ac_mlp
+  - _self_
+
+# 277 Stage1 reference with the Stage2 real-world RTC optimizations enabled.
+runner:
+  logger:
+    experiment_name: zadai_277_rlt_stage2_ac_mlp_rtc
+
+algorithm:
+  raw_rollout_archive:
+    path: ${oc.env:ZADAI_277_RTC_RAW_ROLLOUT_PATH,/home/xlb/data/replay_buffers/zadai_277_rlt_stage2_rtc_raw}
+  replay_buffer:
+    auto_save_path: ${oc.env:ZADAI_277_RTC_REPLAY_BUFFER_PATH,/home/xlb/data/replay_buffers/zadai_277_rlt_stage2_rtc}
+  demo_buffer:
+    load_path: ${oc.env:ZADAI_277_DEMO_BUFFER_PATH,/home/xlb/data/replay_buffers/zadai_9_16_joint_expert_30/rank_0}
+
+rollout:
+  rlt_skip_noncritical_trajectory: True
+  chunk_async_prefetch:
+    enable: True
+    steps_before_end: 10
+    noncritical_only: True
+  rlt_feature_model:
+    model_path: ${oc.env:ZADAI_277_STAGE1_CHECKPOINT,/home/xlb/data/checkpoints/zadai_277_rlt_stage1/global_step_20000/actor}
+    openpi_data:
+      repo_id: zadai_277_rlinf_v21
+      norm_stats_path: ${oc.env:ZADAI_277_NORM_STATS_PATH,/home/xlb/data/checkpoints/zadai_277_rlt_stage1/norm_stats.json}
+    openpi:
+      rtc_enabled: True

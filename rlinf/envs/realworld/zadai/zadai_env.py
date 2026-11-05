@@ -196,14 +196,14 @@ class Zadai200RobotConfig:
     enforce_action_delta_limit: bool = True
     # ``None`` means no limit; grippers are intentionally unrestricted.
     max_action_delta: list[float | None] = field(
-        default_factory=lambda: [0.10] * 14 + [None, None]
+        default_factory=lambda: [0.22] * 14 + [None, None]
     )
     # Bound the total motion of a submitted chunk relative to the observation
     # from which it was generated. This prevents per-step limits accumulating
     # into a large one-second move.
     enforce_chunk_action_delta_limit: bool = True
     max_chunk_action_delta: list[float | None] = field(
-        default_factory=lambda: [0.50] * 14 + [None, None]
+        default_factory=lambda: [3.00] * 14 + [None, None]
     )
     joint_lower: list[float] = field(default_factory=lambda: [-np.pi] * 14)
     joint_upper: list[float] = field(default_factory=lambda: [np.pi] * 14)
@@ -306,6 +306,7 @@ class Zadai200Env(gym.Env):
         self._submitted_chunk: list[dict[str, Any]] | None = None
         self._submitted_chunk_index = 0
         self._submitted_chunk_started_at: float | None = None
+        self._rollout_prefetch_sent = False
         self._runtime_log_path = self.config.runtime_log_path
         append_runtime_event(
             self._runtime_log_path,
@@ -315,6 +316,7 @@ class Zadai200Env(gym.Env):
                 "step_frequency_hz": self.config.step_frequency,
                 "action_mode": self.config.action_mode,
                 "max_action_delta": self.config.max_action_delta,
+                "max_chunk_action_delta": self.config.max_chunk_action_delta,
                 "eef_policy_to_runtime_tool_offset_m": (
                     self.config.eef_policy_to_runtime_tool_offset_m
                 ),
@@ -579,6 +581,7 @@ class Zadai200Env(gym.Env):
         self._submitted_chunk = None
         self._submitted_chunk_index = 0
         self._submitted_chunk_started_at = None
+        self._rollout_prefetch_sent = False
         self._last_commanded_physical = None
         if self.config.is_dummy:
             return self._dummy_observation(), {}
@@ -598,6 +601,60 @@ class Zadai200Env(gym.Env):
             {
                 "event": "env_reset",
                 "elapsed_steps": self._elapsed_steps,
+                "observed_physical": self._last_observed_physical,
+            },
+        )
+        return obs, info
+
+    @property
+    def action_chunk_complete(self) -> bool:
+        return self.config.action_transport != "chunk" or self._submitted_chunk is None
+
+    @property
+    def rollout_prefetch_sent(self) -> bool:
+        return self._rollout_prefetch_sent
+
+    def mark_rollout_prefetch_sent(self) -> None:
+        """Record that the next policy chunk was inferred from this chunk."""
+        self._rollout_prefetch_sent = True
+
+    def operator_go_home(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Pause policy execution, open grippers, home, then resume observation."""
+        if self.config.is_dummy:
+            return self._dummy_observation(), {"operator_go_home": True}
+
+        append_runtime_event(
+            self._runtime_log_path,
+            {"event": "operator_go_home_start", "elapsed_steps": self._elapsed_steps},
+        )
+        response = self._session.post(self._url("hold"), timeout=self.config.timeout)
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("success", False):
+            raise RuntimeError(f"VLAHost hold failed: {payload}")
+
+        self._reset_grippers()
+        response = self._session.post(
+            self._url("go_home"), timeout=self.config.timeout
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("success", False):
+            raise RuntimeError(f"VLAHost go_home failed: {payload}")
+        if self.config.reset_wait_s > 0:
+            time.sleep(self.config.reset_wait_s)
+
+        self._post_session(True)
+        self._last_session_refresh = time.monotonic()
+        self._last_commanded_physical = None
+        obs, info = self._state()
+        info["operator_go_home"] = True
+        append_runtime_event(
+            self._runtime_log_path,
+            {
+                "event": "operator_go_home_complete",
+                "elapsed_steps": self._elapsed_steps,
+                "wait_s": self.config.reset_wait_s,
                 "observed_physical": self._last_observed_physical,
             },
         )
@@ -709,6 +766,31 @@ class Zadai200Env(gym.Env):
                         self.config.max_eef_chunk_rotation_delta_rad,
                     )
         safety_delta = requested_physical - physical_action
+        if self.config.control_space == "joint":
+            append_runtime_event(
+                self._runtime_log_path,
+                {
+                    "event": "joint_action_transform",
+                    "elapsed_steps": self._elapsed_steps,
+                    "requested_normalized": requested_normalized,
+                    "requested_physical_before_limits": requested_physical,
+                    "previous_physical_reference": reference,
+                    "chunk_physical_reference": chunk_reference,
+                    "physical_after_limits": physical_action,
+                    "safety_delta_physical": safety_delta,
+                    "safety_clipped": bool(np.any(np.abs(safety_delta) > 1e-6)),
+                    "max_requested_step_delta_rad": (
+                        float(np.max(np.abs(requested_physical - reference)))
+                        if reference is not None
+                        else None
+                    ),
+                    "max_output_step_delta_rad": (
+                        float(np.max(np.abs(physical_action - reference)))
+                        if reference is not None
+                        else None
+                    ),
+                },
+            )
         return {
             "requested_normalized": requested_normalized.copy(),
             "requested_physical": requested_physical.copy(),
@@ -751,6 +833,7 @@ class Zadai200Env(gym.Env):
         """Submit one intervention-aware VLAHost action chunk."""
         if self.config.action_transport != "chunk" or self.config.is_dummy:
             return
+        self._rollout_prefetch_sent = False
         actions = np.asarray(actions, dtype=np.float32)
         if (
             actions.ndim != 2
@@ -763,6 +846,10 @@ class Zadai200Env(gym.Env):
                 f"{actions.shape}"
             )
         prepared = []
+        requested_step_deltas = []
+        sent_step_deltas = []
+        requested_chunk_deltas = []
+        sent_chunk_deltas = []
         last_commanded = getattr(self, "_last_commanded_physical", None)
         reference = (
             last_commanded
@@ -771,13 +858,44 @@ class Zadai200Env(gym.Env):
         )
         chunk_reference = None if reference is None else reference.copy()
         for action in actions:
+            step_reference = None if reference is None else reference.copy()
             step = self._prepare_physical_action(
                 action,
                 reference,
                 chunk_reference=chunk_reference,
             )
             prepared.append(step)
+            if step_reference is not None:
+                requested_step_deltas.append(
+                    np.abs(step["requested_physical"] - step_reference)
+                )
+                sent_step_deltas.append(
+                    np.abs(step["physical_action"] - step_reference)
+                )
+            if chunk_reference is not None:
+                requested_chunk_deltas.append(
+                    np.abs(step["requested_physical"] - chunk_reference)
+                )
+                sent_chunk_deltas.append(
+                    np.abs(step["physical_action"] - chunk_reference)
+                )
             reference = step["physical_action"]
+
+        def max_per_dim(values: list[np.ndarray]) -> np.ndarray:
+            if not values:
+                return np.zeros(self._action_dim, dtype=np.float32)
+            return np.max(np.stack(values), axis=0).astype(np.float32)
+
+        safety_deltas = np.stack(
+            [np.abs(step["safety_delta"]) for step in prepared]
+        )
+        clipped = safety_deltas > 1e-6
+        clip_steps = clipped.any(axis=1)
+        max_requested_step_delta = max_per_dim(requested_step_deltas)
+        max_sent_step_delta = max_per_dim(sent_step_deltas)
+        max_requested_chunk_delta = max_per_dim(requested_chunk_deltas)
+        max_sent_chunk_delta = max_per_dim(sent_chunk_deltas)
+        max_abs_safety_delta = safety_deltas.max(axis=0).astype(np.float32)
         response = self._session.post(
             self._url("action_chunk"),
             json={
@@ -809,6 +927,20 @@ class Zadai200Env(gym.Env):
                 "chunk_id": result.get("chunk_id"),
                 "execution": result.get("execution"),
                 "observation_generation": self._last_intervention_refresh_generation,
+                "action_space": self.config.control_space,
+                "safety_clip_step_count": int(clip_steps.sum()),
+                "safety_clip_step_fraction": float(clip_steps.mean()),
+                "safety_clip_count_per_dim": clipped.sum(axis=0),
+                "max_requested_step_delta_per_dim": max_requested_step_delta,
+                "max_sent_step_delta_per_dim": max_sent_step_delta,
+                "max_requested_chunk_delta_per_dim": max_requested_chunk_delta,
+                "max_sent_chunk_delta_per_dim": max_sent_chunk_delta,
+                "max_abs_safety_delta_per_dim": max_abs_safety_delta,
+                "max_requested_step_delta": float(max_requested_step_delta.max()),
+                "max_sent_step_delta": float(max_sent_step_delta.max()),
+                "max_requested_chunk_delta": float(max_requested_chunk_delta.max()),
+                "max_sent_chunk_delta": float(max_sent_chunk_delta.max()),
+                "max_abs_safety_delta": float(max_abs_safety_delta.max()),
             },
         )
 

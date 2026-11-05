@@ -50,17 +50,18 @@ override_cfg:
   # Submit each 30-step policy output through VLAHost's intervention-aware
   # /action_chunk endpoint, while still polling /state once per low-level step.
   action_transport: chunk
-  # Physical per-step target-change limits: 14 joints (rad); null disables
-  # the limit for the two grippers.
+  # Dataset-calibrated physical limits (9_16_zadai_joint_clean, 30 Hz).
+  # Demonstration maxima are 0.197 rad/step and 2.721 rad/30-step chunk;
+  # use rounded values with about 10% headroom. null disables gripper limits.
   enforce_action_delta_limit: true
-  max_action_delta: [0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10,
-                      0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10,
+  max_action_delta: [0.22, 0.22, 0.22, 0.22, 0.22, 0.22, 0.22,
+                      0.22, 0.22, 0.22, 0.22, 0.22, 0.22, 0.22,
                       null, null]
   # Also cap total motion over the full 30-step chunk relative to the
   # observation used for inference, so per-step limits cannot accumulate.
   enforce_chunk_action_delta_limit: true
-  max_chunk_action_delta: [0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50,
-                            0.50, 0.50, 0.50, 0.50, 0.50, 0.50, 0.50,
+  max_chunk_action_delta: [3.00, 3.00, 3.00, 3.00, 3.00, 3.00, 3.00,
+                            3.00, 3.00, 3.00, 3.00, 3.00, 3.00, 3.00,
                             null, null]
   image_split_mode: hero3
   image_width: 640

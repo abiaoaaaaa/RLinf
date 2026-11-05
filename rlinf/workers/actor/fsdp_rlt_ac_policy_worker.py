@@ -247,11 +247,9 @@ class RLTACLossMixin:
             )
         )
         if in_warmup:
-            bc_weight = warmup_bc_weight
-            q_weight = warmup_q_weight
-            ramp_progress = 0.0
+            update_ramp_progress = 0.0
         elif ramp_updates > 0:
-            ramp_progress = min(
+            update_ramp_progress = min(
                 1.0,
                 max(
                     0.0,
@@ -259,16 +257,32 @@ class RLTACLossMixin:
                     / float(ramp_updates),
                 ),
             )
-            bc_weight = warmup_bc_weight + ramp_progress * (
-                online_bc_weight - warmup_bc_weight
-            )
-            q_weight = warmup_q_weight + ramp_progress * (
-                online_q_weight - warmup_q_weight
+        else:
+            update_ramp_progress = 1.0
+
+        min_online_successes = int(schedule_cfg.get("min_online_successes", 0))
+        ramp_online_successes = int(schedule_cfg.get("ramp_online_successes", 0))
+        online_successes = int(getattr(self, "online_successful_episodes", 0))
+        if min_online_successes <= 0:
+            success_ramp_progress = 1.0
+        elif online_successes < min_online_successes:
+            success_ramp_progress = 0.0
+        elif ramp_online_successes > 0:
+            success_ramp_progress = min(
+                1.0,
+                float(online_successes - min_online_successes + 1)
+                / float(ramp_online_successes),
             )
         else:
-            bc_weight = online_bc_weight
-            q_weight = online_q_weight
-            ramp_progress = 1.0
+            success_ramp_progress = 1.0
+
+        ramp_progress = min(update_ramp_progress, success_ramp_progress)
+        bc_weight = warmup_bc_weight + ramp_progress * (
+            online_bc_weight - warmup_bc_weight
+        )
+        q_weight = warmup_q_weight + ramp_progress * (
+            online_q_weight - warmup_q_weight
+        )
 
         metrics = {
             "bc_weight": bc_weight,
@@ -276,6 +290,10 @@ class RLTACLossMixin:
             "actor_weight_schedule_enabled": 1.0,
             "actor_weight_in_warmup": float(in_warmup),
             "actor_weight_ramp_progress": ramp_progress,
+            "actor_weight_update_ramp_progress": update_ramp_progress,
+            "actor_weight_success_ramp_progress": success_ramp_progress,
+            "actor_weight_online_successes": float(online_successes),
+            "actor_weight_min_online_successes": float(min_online_successes),
         }
         return bc_weight, q_weight, metrics
 
@@ -449,10 +467,43 @@ class RLTACReplayMixin:
 
     @staticmethod
     def _transition_done_value(traj: Trajectory) -> bool | None:
-        dones = traj.dones
-        if not isinstance(dones, torch.Tensor) or dones.numel() == 0:
+        terminal_flags = [
+            value
+            for value in (traj.terminations, traj.truncations, traj.dones)
+            if isinstance(value, torch.Tensor) and value.numel() > 0
+        ]
+        if not terminal_flags:
             return None
-        return bool(dones.detach().to(torch.bool).reshape(-1).any().item())
+        return any(
+            bool(value.detach().to(torch.bool).reshape(-1).any().item())
+            for value in terminal_flags
+        )
+
+    def _count_replay_successes(self) -> int:
+        replay_buffer = self.replay_buffer
+        successes = 0
+        for trajectory_id in replay_buffer._trajectory_id_list:
+            trajectory_info = replay_buffer._trajectory_index[trajectory_id]
+            trajectory = replay_buffer._load_trajectory(
+                trajectory_id,
+                trajectory_info["model_weights_id"],
+            )
+            successes += int(
+                self._transition_done_value(trajectory) is True
+                and (self._transition_reward_value(trajectory) or 0.0) > 0.0
+            )
+        return successes
+
+    def load_checkpoint(self, load_base_path):
+        super().load_checkpoint(load_base_path)
+        replay_successes = self._count_replay_successes()
+        checkpoint_successes = int(self.online_successful_episodes)
+        self.online_successful_episodes = max(checkpoint_successes, replay_successes)
+        if self.online_successful_episodes > checkpoint_successes:
+            self.logger.info(
+                "Recovered %d online successful episodes from replay buffer.",
+                self.online_successful_episodes,
+            )
 
     @staticmethod
     def _row_tensor(tensor: torch.Tensor, idx: int) -> torch.Tensor:
@@ -600,6 +651,16 @@ class RLTACReplayMixin:
                             self._step_env_tensor(done_value, done_idx, env_idx),
                         )
 
+                terminal_flags = [
+                    value
+                    for value in (transition.terminations, transition.truncations)
+                    if isinstance(value, torch.Tensor)
+                ]
+                if terminal_flags:
+                    transition.dones = torch.stack(
+                        [value.to(torch.bool) for value in terminal_flags]
+                    ).any(dim=0)
+
                 is_done = (
                     isinstance(transition.dones, torch.Tensor)
                     and transition.dones.reshape(-1).to(torch.bool).any()
@@ -672,6 +733,16 @@ class RLTACReplayMixin:
             **self._transition_replay_metrics(replay_list),
             **collect_trajectory_replay_metrics(recv_list, reducer=all_reduce_dict),
         }
+        if hasattr(self, "online_successful_episodes"):
+            new_successes = sum(
+                self._transition_done_value(traj) is True
+                and (self._transition_reward_value(traj) or 0.0) > 0.0
+                for traj in replay_list
+            )
+            self.online_successful_episodes += int(new_successes)
+            self._last_replay_metrics["replay/online_successful_episodes"] = float(
+                self.online_successful_episodes
+            )
         self.replay_buffer.add_trajectories(replay_list)
 
         if self.demo_buffer is not None:
@@ -707,6 +778,7 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         self.episodes_since_train = 0
         self.total_transitions_added = 0
         self.total_episodes_added = 0
+        self.online_successful_episodes = 0
         self._warmup_ready_total_transitions: int | None = None
         self._warmup_ready_total_episodes: int | None = None
         self.pending_update_budget = 0
@@ -785,6 +857,9 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
                 counters["total_transitions_added"]
             )
             self._warmup_ready_total_episodes = int(counters["total_episodes_added"])
+            self._schedule_base_update_step = max(
+                int(self.update_step), warmup_required_updates
+            )
 
         train_every_transitions = int(schedule_cfg.get("train_every_transitions", 0))
         train_every_episodes = int(schedule_cfg.get("train_every_episodes", 0))
@@ -834,9 +909,9 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
                         else 0
                     )
                     online_cycles = max(transition_cycles, episode_cycles)
-                desired_total_updates = (
-                    warmup_required_updates + online_cycles * update_epoch
-                )
+                desired_total_updates = getattr(
+                    self, "_schedule_base_update_step", warmup_required_updates
+                ) + online_cycles * update_epoch
             pending_updates = max(desired_total_updates - int(self.update_step), 0)
             updates_scheduled = pending_updates
             updates_to_run = pending_updates
@@ -892,6 +967,8 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         updates_to_run, schedule_metrics = self._rlt_updates_to_run()
         if updates_to_run <= 0:
             mean_metric_dict = self.process_train_metrics(schedule_metrics)
+            if bool(self.cfg.runner.get("actor_only", False)):
+                mean_metric_dict["__global_step"] = int(self.update_step)
             torch.cuda.synchronize()
             torch.distributed.barrier()
             torch.cuda.empty_cache()
@@ -931,6 +1008,8 @@ class RLTACFSDPPolicy(RLTACLossMixin, RLTACReplayMixin, EmbodiedSACFSDPPolicy):
         )
         append_to_dict(metrics, schedule_metrics)
         mean_metric_dict = self.process_train_metrics(metrics)
+        if bool(self.cfg.runner.get("actor_only", False)):
+            mean_metric_dict["__global_step"] = int(self.update_step)
         self.transitions_since_train = 0
         self.episodes_since_train = 0
 

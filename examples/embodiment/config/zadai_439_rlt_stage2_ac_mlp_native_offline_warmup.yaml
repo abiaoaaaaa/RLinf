@@ -1,0 +1,14 @@
+defaults:
+  - zadai_439_rlt_stage2_ac_mlp_native
+  - _self_
+
+# Actor-only Stage2 warmup: no EnvWorker, RolloutWorker, VLAHost, or robot.
+runner:
+  actor_only: true
+  max_epochs: 200
+  max_steps: 200
+  val_check_interval: -1
+  save_interval: 200
+  log_interval: 20
+  logger:
+    experiment_name: zadai_439_rlt_stage2_residual_offline_warmup

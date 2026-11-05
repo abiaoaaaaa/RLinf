@@ -6,14 +6,23 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 
+import json
+
 import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 
 from toolkits.marvin.convert_online_buffer_joint_to_eef import convert_trajectory
 from toolkits.marvin.label_eef_rl_demo_buffer import (
     EpisodeLabel,
     _chunk_starts,
+    _dataset_root,
+    _episode_sources,
+    _episode_table,
     _transition_dict,
+    _validate_rlt_buffer,
+    _video_path,
 )
 
 
@@ -38,9 +47,12 @@ def test_episode_label_preserves_unfinished_interval():
     assert encoded["rl_intervals"] == [[10, 20]]
     assert decoded.open_start == 30
     assert _chunk_starts([10, 75], 30) == [10, 40, 70]
+    assert _chunk_starts([0, 299], 30, 5) == list(range(0, 271, 5))
+    assert _chunk_starts([0, 298], 30, 5)[-2:] == [265, 269]
+    assert _chunk_starts([0, 20], 30, 5) == [0]
 
 
-def test_demo_transition_has_success_only_at_terminal_step():
+def test_demo_transition_has_success_only_at_terminal_step(tmp_path):
     curr = {
         "z_rl": torch.zeros(1, 8),
         "proprio": torch.zeros(1, 20),
@@ -55,6 +67,7 @@ def test_demo_transition_has_success_only_at_terminal_step():
         actions,
         terminal=True,
         success=True,
+        model_weights_id="offline_eef_demo",
     )
 
     assert transition["actions"].shape == (1, 1, 600)
@@ -63,6 +76,81 @@ def test_demo_transition_has_success_only_at_terminal_step():
     assert transition["rewards"][..., -1].item() == 1
     assert transition["dones"].sum().item() == 1
     assert transition["dones"][..., -1].item()
+
+    torch.save(transition, tmp_path / "trajectory_0_offline_eef_demo.pt")
+    (tmp_path / "metadata.json").write_text(
+        json.dumps(
+            {
+                "trajectory_format": "pt",
+                "size": 1,
+                "total_samples": 1,
+                "trajectory_counter": 1,
+                "seed": 1234,
+            }
+        )
+    )
+    (tmp_path / "trajectory_index.json").write_text(
+        json.dumps(
+            {
+                "trajectory_index": {
+                    "0": {
+                        "num_samples": 1,
+                        "trajectory_id": 0,
+                        "max_episode_length": 1,
+                        "shape": [1, 1, 30],
+                        "model_weights_id": "offline_eef_demo",
+                    }
+                },
+                "trajectory_id_list": [0],
+            }
+        )
+    )
+    _validate_rlt_buffer(tmp_path, chunk_size=30, action_dim=20)
+
+
+def test_lerobot_v3_episode_slices_and_video_paths(tmp_path):
+    dataset = tmp_path / "dataset"
+    data_path = dataset / "data/chunk-000/file-000.parquet"
+    episode_path = dataset / "meta/episodes/chunk-000/file-000.parquet"
+    data_path.parent.mkdir(parents=True)
+    episode_path.parent.mkdir(parents=True)
+    pq.write_table(
+        pa.table(
+            {
+                "frame_index": [0, 1, 0, 1, 2],
+                "episode_index": [0, 0, 1, 1, 1],
+            }
+        ),
+        data_path,
+    )
+    episode_rows = {
+        "episode_index": [0, 1],
+        "data/chunk_index": [0, 0],
+        "data/file_index": [0, 0],
+        "dataset_from_index": [0, 2],
+        "dataset_to_index": [2, 5],
+    }
+    for view in (
+        "observation.images.top",
+        "observation.images.wrist_L",
+        "observation.images.wrist_R",
+    ):
+        episode_rows[f"videos/{view}/chunk_index"] = [0, 0]
+        episode_rows[f"videos/{view}/file_index"] = [0, 1]
+        video_dir = dataset / "videos" / view / "chunk-000"
+        video_dir.mkdir(parents=True)
+        (video_dir / "file-000.mp4").touch()
+        (video_dir / "file-001.mp4").touch()
+    pq.write_table(pa.table(episode_rows), episode_path)
+
+    sources = _episode_sources(dataset / "videos")
+
+    assert _dataset_root(dataset / "videos") == dataset
+    assert len(_episode_table(sources[0])) == 2
+    assert len(_episode_table(sources[1])) == 3
+    assert _video_path(
+        dataset, "observation.images.top", 1, sources[1]
+    ).name == "file-001.mp4"
 
 
 def test_joint_replay_conversion_changes_only_geometry_fields():

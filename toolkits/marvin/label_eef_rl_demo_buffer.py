@@ -6,35 +6,41 @@
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
 #
-"""Interactively label EEF demonstrations and materialize an RLT demo buffer.
+"""Interactively label Zadai demonstrations and materialize an RLT demo buffer.
 
 This tool deliberately separates the inexpensive, resumable annotation pass
 from GPU feature extraction::
 
-    # A1: review videos, mark one or more critical (RL) intervals, and label
-    #     the outcome at the selected terminal frame.
+    # A1: review videos and select at most 30 full expert episodes. Passing the
+    #     ``videos`` subdirectory is accepted and resolved to the dataset root.
     python3 toolkits/marvin/label_eef_rl_demo_buffer.py annotate \
-        --dataset /data/zadai_200_eef_rot6d_rlinf_v21 \
-        --annotations /data/zadai_200_eef_annotations.json
+        --dataset /data/9_16_zadai_joint_clean/videos \
+        --annotations /data/zadai_joint_expert_annotations.json \
+        --max-expert-episodes 30
 
-    # A2: run the jointly trained EEF Pi0.5/RLT Stage-1 model and write a
+    # A2: run the matching Pi0.5/RLT Stage-1 model and write a
     #     TrajectoryReplayBuffer-compatible rank directory.
     python3 toolkits/marvin/label_eef_rl_demo_buffer.py export \
-        --dataset /data/zadai_200_eef_rot6d_rlinf_v21 \
-        --annotations /data/zadai_200_eef_annotations.json \
-        --output /data/zadai_200_eef_demo_buffer/rank_0 \
-        --stage1-checkpoint /checkpoints/eef_stage1/actor \
-        --norm-stats /data/zadai_200_eef_norm_stats/norm_stats.json
+        --dataset /data/9_16_zadai_joint_clean \
+        --annotations /data/zadai_joint_expert_annotations.json \
+        --output /data/zadai_joint_demo_buffer/rank_0 \
+        --stage1-checkpoint /checkpoints/zadai_277_stage1/actor \
+        --norm-stats /checkpoints/zadai_277_stage1/norm_stats.json \
+        --action-space joint --expected-episodes 30
 
 Neither command edits the source dataset.  ``annotate`` atomically replaces
 only its sidecar JSON.  ``export`` refuses an existing output directory.
+
+Both LeRobot v2.1 (one parquet per episode) and v3 (episode slices in shared
+parquet files) are supported. The source dataset is never modified.
 
 Annotation keys
 ---------------
 Space: play/pause; A/D: seek one frame; J/L: seek one second; ``[``: start an
 RL interval; ``]``: end it; S: mark success at this frame; F: mark failure;
-N: save and advance; B: save and go back; X: clear this episode; Q/Esc: save
-and quit.  Multiple ``[``/``]`` pairs are supported.
+E: select the complete episode as a successful expert demonstration; N: save
+and advance; B: save and go back; X: clear this episode; Q/Esc: save and quit.
+Multiple ``[``/``]`` pairs are supported.
 """
 
 from __future__ import annotations
@@ -53,6 +59,7 @@ from typing import Any
 import numpy as np
 
 EEF_DIM = 20
+JOINT_DIM = 16
 DEFAULT_CHUNK_SIZE = 30
 DEFAULT_PROMPT = "Insert the tail of the yellow cable tie into its head to fasten it."
 VIEWS = (
@@ -82,20 +89,87 @@ def _read_jsonl(path: Path) -> list[dict[str, Any]]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
-def _episode_files(dataset: Path) -> dict[int, Path]:
-    files: dict[int, Path] = {}
+@dataclass(frozen=True)
+class EpisodeSource:
+    data_path: Path
+    start: int
+    stop: int
+    video_locations: dict[str, tuple[int, int]]
+
+
+def _dataset_root(dataset: Path) -> Path:
+    dataset = dataset.resolve()
+    return dataset.parent if dataset.name == "videos" else dataset
+
+
+def _episode_sources(dataset: Path) -> dict[int, EpisodeSource]:
+    import pyarrow.parquet as pq
+
+    dataset = _dataset_root(dataset)
+    files: dict[int, EpisodeSource] = {}
     for path in sorted((dataset / "data").rglob("episode_*.parquet")):
         try:
             episode = int(path.stem.split("_")[-1])
         except ValueError:
             continue
-        files[episode] = path
+        files[episode] = EpisodeSource(
+            data_path=path,
+            start=0,
+            stop=pq.read_metadata(path).num_rows,
+            video_locations={},
+        )
+    if files:
+        return files
+
+    episode_meta_files = sorted((dataset / "meta" / "episodes").rglob("*.parquet"))
+    if episode_meta_files:
+        for row in pq.read_table(episode_meta_files).to_pylist():
+            episode = int(row["episode_index"])
+            data_path = dataset / "data" / (
+                f"chunk-{int(row['data/chunk_index']):03d}/"
+                f"file-{int(row['data/file_index']):03d}.parquet"
+            )
+            video_locations = {
+                view: (
+                    int(row[f"videos/{view}/chunk_index"]),
+                    int(row[f"videos/{view}/file_index"]),
+                )
+                for view in VIEWS
+            }
+            files[episode] = EpisodeSource(
+                data_path=data_path,
+                start=int(row["dataset_from_index"]),
+                stop=int(row["dataset_to_index"]),
+                video_locations=video_locations,
+            )
     if not files:
-        raise FileNotFoundError(f"no episode parquet files below {dataset / 'data'}")
+        raise FileNotFoundError(f"no episode metadata below {dataset}")
     return files
 
 
-def _video_path(dataset: Path, view: str, episode: int) -> Path:
+def _episode_table(source: EpisodeSource, columns: list[str] | None = None):
+    import pyarrow.parquet as pq
+
+    table = pq.read_table(source.data_path, columns=columns)
+    return table.slice(source.start, source.stop - source.start)
+
+
+def _video_path(
+    dataset: Path, view: str, episode: int, source: EpisodeSource
+) -> Path:
+    dataset = _dataset_root(dataset)
+    if view in source.video_locations:
+        chunk, file_index = source.video_locations[view]
+        path = (
+            dataset
+            / "videos"
+            / view
+            / f"chunk-{chunk:03d}"
+            / f"file-{file_index:03d}.mp4"
+        )
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        return path
     candidates = [
         path
         for path in (dataset / "videos").rglob(f"episode_{episode:06d}.mp4")
@@ -109,6 +183,7 @@ def _video_path(dataset: Path, view: str, episode: int) -> Path:
 
 
 def _load_annotations(path: Path, dataset: Path) -> dict[str, Any]:
+    dataset = _dataset_root(dataset)
     if path.exists():
         value = json.loads(path.read_text(encoding="utf-8"))
         if Path(value["dataset"]).resolve() != dataset.resolve():
@@ -117,7 +192,7 @@ def _load_annotations(path: Path, dataset: Path) -> dict[str, Any]:
             )
         return value
     return {
-        "format": "zadai_eef_rl_annotations_v1",
+        "format": "zadai_rl_annotations_v2",
         "dataset": str(dataset.resolve()),
         "episodes": {},
     }
@@ -159,19 +234,37 @@ class EpisodeLabel:
         }
 
 
-def annotate(dataset: Path, annotations: Path, start_episode: int | None) -> None:
+def _expert_episode_count(sidecar: dict[str, Any]) -> int:
+    return sum(
+        bool(value.get("rl_intervals")) and value.get("outcome") == "success"
+        for value in sidecar["episodes"].values()
+    )
+
+
+def _is_expert_label(value: dict[str, Any]) -> bool:
+    return bool(value.get("rl_intervals")) and value.get("outcome") == "success"
+
+
+def annotate(
+    dataset: Path,
+    annotations: Path,
+    start_episode: int | None,
+    max_expert_episodes: int | None,
+) -> None:
+    if max_expert_episodes is not None and max_expert_episodes < 1:
+        raise ValueError("max_expert_episodes must be >= 1")
     try:
         import cv2
-        import pyarrow.parquet as pq
     except ImportError as exc:
-        raise RuntimeError("annotate requires opencv-python and pyarrow") from exc
+        raise RuntimeError("annotate requires opencv-python") from exc
 
-    episode_files = _episode_files(dataset)
-    episode_ids = sorted(episode_files)
+    dataset = _dataset_root(dataset)
+    episode_sources = _episode_sources(dataset)
+    episode_ids = sorted(episode_sources)
     sidecar = _load_annotations(annotations, dataset)
     start_pos = 0
     if start_episode is not None:
-        if start_episode not in episode_files:
+        if start_episode not in episode_sources:
             raise ValueError(f"episode {start_episode} does not exist")
         start_pos = episode_ids.index(start_episode)
     else:
@@ -183,10 +276,11 @@ def annotate(dataset: Path, annotations: Path, start_episode: int | None) -> Non
     pos = start_pos
     while 0 <= pos < len(episode_ids):
         episode = episode_ids[pos]
-        table = pq.read_table(episode_files[episode], columns=["frame_index"])
-        frame_count = len(table)
+        source = episode_sources[episode]
+        frame_count = source.stop - source.start
         captures = [
-            cv2.VideoCapture(str(_video_path(dataset, view, episode))) for view in VIEWS
+            cv2.VideoCapture(str(_video_path(dataset, view, episode, source)))
+            for view in VIEWS
         ]
         if any(not capture.isOpened() for capture in captures):
             raise RuntimeError(f"failed to open videos for episode {episode}")
@@ -215,8 +309,8 @@ def annotate(dataset: Path, annotations: Path, start_episode: int | None) -> Non
                 lines = [
                     f"episode {episode} ({pos + 1}/{len(episode_ids)})  frame {frame}/{frame_count - 1}",
                     f"RL={in_rl} intervals={label.intervals} open={label.open_start}",
-                    f"outcome={label.outcome} terminal={label.terminal_frame}  {status}",
-                    "SPACE play | [ start | ] end | S success | F fail | N next | Q quit",
+                    f"outcome={label.outcome} terminal={label.terminal_frame}  experts={_expert_episode_count(sidecar)}/{max_expert_episodes or '-'}  {status}",
+                    "SPACE play | E full expert | [ start | ] end | S success | F fail | N next | Q quit",
                 ]
                 for row, line in enumerate(lines):
                     cv2.putText(
@@ -228,7 +322,7 @@ def annotate(dataset: Path, annotations: Path, start_episode: int | None) -> Non
                         colour,
                         2,
                     )
-                cv2.imshow("Zadai EEF RL annotation", canvas)
+                cv2.imshow("Zadai RL annotation", canvas)
                 key = cv2.waitKey(max(1, int(1000 / fps)) if playing else 0) & 0xFF
                 status = ""
                 if key == ord(" "):
@@ -258,11 +352,41 @@ def annotate(dataset: Path, annotations: Path, start_episode: int | None) -> Non
                         label.close_interval(frame)
                     label.outcome, label.terminal_frame = "failure", frame
                     status = "failure terminal set"
+                elif key == ord("e"):
+                    saved_label = sidecar["episodes"].get(str(episode), {})
+                    selected_without_current = _expert_episode_count(sidecar) - int(
+                        _is_expert_label(saved_label)
+                    )
+                    if (
+                        max_expert_episodes is not None
+                        and selected_without_current >= max_expert_episodes
+                    ):
+                        status = f"expert limit {max_expert_episodes} already reached"
+                    else:
+                        label = EpisodeLabel(
+                            intervals=[[0, frame_count - 1]],
+                            outcome="success",
+                            terminal_frame=frame_count - 1,
+                        )
+                        status = "complete episode selected as expert"
                 elif key == ord("x"):
                     label = EpisodeLabel([])
                     status = "episode label cleared"
                 elif key in (ord("n"), ord("b"), ord("q"), 27):
-                    sidecar["episodes"][str(episode)] = label.to_dict()
+                    candidate = label.to_dict()
+                    old = sidecar["episodes"].get(str(episode), {})
+                    candidate_count = (
+                        _expert_episode_count(sidecar)
+                        - int(_is_expert_label(old))
+                        + int(_is_expert_label(candidate))
+                    )
+                    if (
+                        max_expert_episodes is not None
+                        and candidate_count > max_expert_episodes
+                    ):
+                        status = f"expert limit {max_expert_episodes} exceeded"
+                        continue
+                    sidecar["episodes"][str(episode)] = candidate
                     _atomic_json(annotations, sidecar)
                     if key in (ord("q"), 27):
                         return
@@ -288,12 +412,13 @@ def _matrix(table: Any, key: str, dim: int) -> np.ndarray:
 
 
 class EpisodeVideoReader:
-    def __init__(self, dataset: Path, episode: int):
+    def __init__(self, dataset: Path, episode: int, source: EpisodeSource):
         import cv2
 
         self.cv2 = cv2
         self.captures = [
-            cv2.VideoCapture(str(_video_path(dataset, view, episode))) for view in VIEWS
+            cv2.VideoCapture(str(_video_path(dataset, view, episode, source)))
+            for view in VIEWS
         ]
         if any(not capture.isOpened() for capture in self.captures):
             raise RuntimeError(f"failed to open videos for episode {episode}")
@@ -323,6 +448,7 @@ def _load_feature_model(args: argparse.Namespace):
         raise RuntimeError(
             "export requires the RLinf OpenPI environment (torch, omegaconf, openpi)"
         ) from exc
+    joint = args.action_space == "joint"
     cfg = OmegaConf.create(
         {
             "model_type": "openpi",
@@ -330,18 +456,20 @@ def _load_feature_model(args: argparse.Namespace):
             "is_lora": False,
             "model_path": str(args.stage1_checkpoint),
             "openpi_data": {
-                "repo_id": "zadai_200_eef_rot6d",
+                "repo_id": "zadai_277_rlinf_v21" if joint else "zadai_200_eef_rot6d",
                 "norm_stats_path": str(args.norm_stats),
             },
             "openpi": {
-                "config_name": "pi05_zadai_eef_rot6d",
+                "config_name": (
+                    "pi05_zadai_ybs_joint_277" if joint else "pi05_zadai_eef_rot6d"
+                ),
                 "num_images_in_input": 3,
                 "action_chunk": args.chunk_size,
                 "action_horizon": args.ref_chunk_size,
-                "action_env_dim": EEF_DIM,
+                "action_env_dim": JOINT_DIM if joint else EEF_DIM,
                 "num_steps": args.num_steps,
                 "state_indices": [],
-                "rlt_action_space": "eef",
+                "rlt_action_space": args.action_space,
                 "use_rlt": True,
                 "rlt_train_only": False,
                 "rlt_prefix_seq_len": 1024,
@@ -384,6 +512,7 @@ def _transition_dict(
     *,
     terminal: bool,
     success: bool,
+    model_weights_id: str,
 ) -> dict:
     chunk = len(actions)
     action = torch.from_numpy(actions).float()
@@ -406,7 +535,7 @@ def _transition_dict(
     }
     return {
         "max_episode_length": 1,
-        "model_weights_id": "offline_eef_demo",
+        "model_weights_id": model_weights_id,
         "actions": flat_action,
         "intervene_flags": flags,
         "rewards": rewards,
@@ -420,30 +549,63 @@ def _transition_dict(
     }
 
 
-def _chunk_starts(interval: list[int], chunk_size: int) -> list[int]:
+def _chunk_starts(
+    interval: list[int], chunk_size: int, chunk_stride: int | None = None
+) -> list[int]:
     start, end = interval
     if start < 0 or end < start:
         raise ValueError(f"invalid RL interval {interval}")
-    return list(range(start, end + 1, chunk_size))
+    stride = chunk_size if chunk_stride is None else chunk_stride
+    if chunk_size < 1 or stride < 1 or stride > chunk_size:
+        raise ValueError("chunk size and stride must satisfy 1 <= stride <= size")
+    if stride == chunk_size:
+        return list(range(start, end + 1, chunk_size))
+    last_start = max(start, end - chunk_size + 1)
+    starts = list(range(start, last_start + 1, stride))
+    if starts[-1] != last_start:
+        starts.append(last_start)
+    return starts
+
+
+def _validate_rlt_buffer(path: Path, chunk_size: int, action_dim: int) -> None:
+    from rlinf.data.replay_buffer import TrajectoryReplayBuffer
+
+    buffer = TrajectoryReplayBuffer(
+        enable_cache=True,
+        cache_size=1,
+        sample_window_size=1,
+        auto_save=False,
+    )
+    try:
+        buffer.load_checkpoint(str(path))
+        sample = buffer.sample(1)
+        if sample["actions"].shape[-1] != chunk_size * action_dim:
+            raise ValueError(
+                "exported action shape does not match the configured Joint/EEF chunk"
+            )
+    finally:
+        buffer.close()
 
 
 def export(args: argparse.Namespace) -> None:
-    import pyarrow.parquet as pq
-
     from rlinf.envs.realworld.zadai.action_codec import (
         DEFAULT_EEF_XYZ_HIGH,
         DEFAULT_EEF_XYZ_LOW,
-        eef_absolute_to_normalized,
+        absolute_to_policy,
     )
 
-    dataset = args.dataset.resolve()
+    if args.expected_episodes is not None and args.expected_episodes < 1:
+        raise ValueError("expected_episodes must be >= 1")
+    if args.chunk_stride is not None and not 1 <= args.chunk_stride <= args.chunk_size:
+        raise ValueError("chunk stride must satisfy 1 <= stride <= chunk size")
+    dataset = _dataset_root(args.dataset)
     output = args.output.resolve()
     if output.exists():
         raise FileExistsError(f"output exists; refusing to modify it: {output}")
     if dataset == output or dataset in output.parents:
         raise ValueError("output must not be inside the source dataset")
     sidecar = _load_annotations(args.annotations, dataset)
-    episode_files = _episode_files(dataset)
+    episode_sources = _episode_sources(dataset)
     selected = {
         int(key): value
         for key, value in sidecar["episodes"].items()
@@ -452,24 +614,46 @@ def export(args: argparse.Namespace) -> None:
     }
     if not selected:
         raise ValueError("no exportable annotated RL intervals")
+    if args.expected_episodes is not None and len(selected) != args.expected_episodes:
+        raise ValueError(
+            f"expected {args.expected_episodes} annotated episodes, got {len(selected)}"
+        )
     model, torch = _load_feature_model(args)
+    action_dim = JOINT_DIM if args.action_space == "joint" else EEF_DIM
+    model_weights_id = f"offline_{args.action_space}_demo"
     staging = output.with_name(f".{output.name}.tmp-{uuid.uuid4().hex}")
     staging.mkdir(parents=True)
     index: dict[str, dict[str, Any]] = {}
     transition_id = 0
     try:
         for episode, label in sorted(selected.items()):
-            if episode not in episode_files:
+            if episode not in episode_sources:
                 raise ValueError(f"annotation references missing episode {episode}")
-            table = pq.read_table(episode_files[episode])
-            states = _matrix(table, "observation.state", EEF_DIM)
-            actions = _matrix(table, "action", EEF_DIM)
-            reader = EpisodeVideoReader(dataset, episode)
+            source = episode_sources[episode]
+            table = _episode_table(source)
+            states = _matrix(table, "observation.state", action_dim)
+            actions = _matrix(table, "action", action_dim)
+            reader = EpisodeVideoReader(dataset, episode, source)
+            obs_cache: dict[int, dict[str, Any]] = {}
+
+            def model_obs_at(frame: int) -> dict[str, Any]:
+                if frame not in obs_cache:
+                    obs_cache[frame] = _model_obs(
+                        model,
+                        torch,
+                        reader.frame(frame),
+                        states[frame],
+                        args.prompt,
+                    )
+                return obs_cache[frame]
+
             try:
                 for interval in label["rl_intervals"]:
                     interval_end = min(int(interval[1]), len(table) - 1)
                     for start in _chunk_starts(
-                        [int(interval[0]), interval_end], args.chunk_size
+                        [int(interval[0]), interval_end],
+                        args.chunk_size,
+                        args.chunk_stride,
                     ):
                         end = min(start + args.chunk_size - 1, interval_end)
                         action_chunk = actions[start : end + 1]
@@ -484,28 +668,15 @@ def export(args: argparse.Namespace) -> None:
                                     ),
                                 ]
                             )
-                        # Stage 1 and the source dataset stay in physical
-                        # absolute EEF space. Stage 2 replay stores exactly the
-                        # normalized domain produced/consumed by the RLT MLP.
+                        # Source demonstrations are physical absolute targets;
+                        # Stage 2 replay stores the normalized RLT policy domain.
                         action_chunk = np.asarray(
-                            eef_absolute_to_normalized(action_chunk),
+                            absolute_to_policy(action_chunk, args.action_space),
                             dtype=np.float32,
                         )
                         next_frame = min(end + 1, len(table) - 1)
-                        curr = _model_obs(
-                            model,
-                            torch,
-                            reader.frame(start),
-                            states[start],
-                            args.prompt,
-                        )
-                        nxt = _model_obs(
-                            model,
-                            torch,
-                            reader.frame(next_frame),
-                            states[next_frame],
-                            args.prompt,
-                        )
+                        curr = model_obs_at(start)
+                        nxt = model_obs_at(next_frame)
                         terminal = label.get("terminal_frame")
                         is_terminal = (
                             terminal is not None and start <= int(terminal) <= end
@@ -518,15 +689,18 @@ def export(args: argparse.Namespace) -> None:
                             action_chunk,
                             terminal=is_terminal,
                             success=success,
+                            model_weights_id=model_weights_id,
                         )
-                        filename = f"trajectory_{transition_id}_offline_eef_demo.pt"
+                        filename = (
+                            f"trajectory_{transition_id}_{model_weights_id}.pt"
+                        )
                         torch.save(trajectory, staging / filename)
                         index[str(transition_id)] = {
                             "num_samples": 1,
                             "trajectory_id": transition_id,
                             "max_episode_length": 1,
                             "shape": [1, 1, args.chunk_size],
-                            "model_weights_id": "offline_eef_demo",
+                            "model_weights_id": model_weights_id,
                             "source_episode": episode,
                             "source_frame_start": start,
                             "source_frame_end": end,
@@ -554,27 +728,43 @@ def export(args: argparse.Namespace) -> None:
         )
         shutil.copy2(args.annotations, staging / "source_annotations.json")
         _atomic_json(
-            staging / "eef_buffer_manifest.json",
+            staging / "demo_buffer_manifest.json",
             {
-                "format": "rlinf_rlt_eef_demo_buffer_v1",
+                "format": "rlinf_rlt_demo_buffer_v2",
                 "source_dataset": str(dataset),
                 "source_annotations": str(args.annotations.resolve()),
                 "stage1_checkpoint": str(args.stage1_checkpoint.resolve()),
                 "norm_stats": str(args.norm_stats.resolve()),
-                "source_action_representation": "absolute_bilateral_eef_xyz_rot6d_gripper_20d",
-                "replay_action_representation": "normalized_bilateral_eef_xyz_rot6d_gripper_20d",
-                "eef_xyz_low": DEFAULT_EEF_XYZ_LOW.tolist(),
-                "eef_xyz_high": DEFAULT_EEF_XYZ_HIGH.tolist(),
+                "action_space": args.action_space,
+                "action_dim": action_dim,
+                "source_action_representation": f"absolute_{args.action_space}",
+                "replay_action_representation": f"normalized_{args.action_space}",
+                "eef_xyz_low": (
+                    DEFAULT_EEF_XYZ_LOW.tolist()
+                    if args.action_space == "eef"
+                    else None
+                ),
+                "eef_xyz_high": (
+                    DEFAULT_EEF_XYZ_HIGH.tolist()
+                    if args.action_space == "eef"
+                    else None
+                ),
                 "chunk_size": args.chunk_size,
+                "chunk_stride": args.chunk_stride or args.chunk_size,
+                "source_episode_count": len(selected),
                 "z_rl_compatibility": "must use the same Stage-1 checkpoint family",
             },
         )
+        _validate_rlt_buffer(staging, args.chunk_size, action_dim)
         output.parent.mkdir(parents=True, exist_ok=True)
         staging.rename(output)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise
-    print(f"wrote {transition_id} EEF RLT transitions to {output}")
+    print(
+        f"wrote {transition_id} {args.action_space} RLT transitions "
+        f"from {len(selected)} episodes to {output}"
+    )
 
 
 def main() -> int:
@@ -584,6 +774,7 @@ def main() -> int:
     label_parser.add_argument("--dataset", type=Path, required=True)
     label_parser.add_argument("--annotations", type=Path, required=True)
     label_parser.add_argument("--start-episode", type=int)
+    label_parser.add_argument("--max-expert-episodes", type=int)
 
     export_parser = subparsers.add_parser(
         "export", help="materialize an RLT demo buffer"
@@ -593,8 +784,17 @@ def main() -> int:
     export_parser.add_argument("--output", type=Path, required=True)
     export_parser.add_argument("--stage1-checkpoint", type=Path, required=True)
     export_parser.add_argument("--norm-stats", type=Path, required=True)
+    export_parser.add_argument(
+        "--action-space", choices=("joint", "eef"), default="eef"
+    )
+    export_parser.add_argument("--expected-episodes", type=int)
     export_parser.add_argument("--device", default="cuda")
     export_parser.add_argument("--chunk-size", type=int, default=DEFAULT_CHUNK_SIZE)
+    export_parser.add_argument(
+        "--chunk-stride",
+        type=int,
+        help="frame stride between overlapping chunks (default: chunk-size)",
+    )
     export_parser.add_argument("--ref-chunk-size", type=int, default=50)
     export_parser.add_argument("--num-steps", type=int, default=10)
     export_parser.add_argument("--prompt", default=DEFAULT_PROMPT)
@@ -603,7 +803,10 @@ def main() -> int:
     try:
         if args.command == "annotate":
             annotate(
-                args.dataset.resolve(), args.annotations.resolve(), args.start_episode
+                args.dataset,
+                args.annotations.resolve(),
+                args.start_episode,
+                args.max_expert_episodes,
             )
         else:
             export(args)

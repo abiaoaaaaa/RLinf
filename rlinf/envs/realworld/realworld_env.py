@@ -291,6 +291,10 @@ class RealWorldEnv(gym.Env):
             infos["rlt_segment_done"] = to_tensor(
                 np.asarray(infos["rlt_segment_done"], dtype=bool)
             )
+        if "operator_go_home_pending" in infos:
+            infos["operator_go_home_pending"] = to_tensor(
+                np.asarray(infos["operator_go_home_pending"], dtype=bool)
+            )
         if "sent_action" in infos:
             infos["sent_action"] = to_tensor(
                 _stack_vector_info(infos["sent_action"], dtype=np.float32)
@@ -308,7 +312,7 @@ class RealWorldEnv(gym.Env):
             infos,
         )
 
-    def chunk_step(self, chunk_actions):
+    def chunk_step(self, chunk_actions, step_callback=None):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
         if self.override_cfg.get("action_transport") == "chunk":
@@ -339,6 +343,8 @@ class RealWorldEnv(gym.Env):
             )
             obs_list.append(extracted_obs)
             infos_list.append(infos)
+            if step_callback is not None:
+                step_callback(i, chunk_size, extracted_obs, infos)
             if "intervene_action" in infos:
                 raw_chunk_intervene_actions.append(infos["intervene_action"])
                 raw_chunk_intervene_flag.append(infos["intervene_flag"])
@@ -407,6 +413,11 @@ class RealWorldEnv(gym.Env):
             chunk_truncations,
             infos_list,
         )
+
+    def mark_rollout_prefetch_sent(self) -> None:
+        """Tell the physical env that this chunk already produced an RTC prefetch."""
+        marker = self.env.envs[0].get_wrapper_attr("mark_rollout_prefetch_sent")
+        marker()
 
     def _handle_auto_reset(self, dones, _final_obs, infos):
         final_obs = copy.deepcopy(_final_obs)

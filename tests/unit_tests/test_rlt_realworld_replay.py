@@ -14,6 +14,7 @@
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 from omegaconf import OmegaConf
 
@@ -28,6 +29,8 @@ from rlinf.algorithms.rlt.transition import update_rlt_transitions
 from rlinf.data.embodied_io_struct import EmbodiedRolloutResult, Trajectory
 from rlinf.data.replay_buffer import TrajectoryReplayBuffer
 from rlinf.workers.actor import fsdp_rlt_ac_policy_worker as rlt_worker
+from rlinf.workers.actor.fsdp_sac_policy_worker import EmbodiedSACFSDPPolicy
+from rlinf.workers.env.env_worker import EnvWorker
 
 
 def _route_result(ref_chunk: torch.Tensor) -> dict:
@@ -273,12 +276,108 @@ def test_realworld_replay_ingest_keeps_only_recorded_transitions(monkeypatch):
     assert harness.replay_buffer.added[0].next_obs["z_rl"].item() == 2.0
 
 
+def test_segment_termination_marks_transition_done_and_counts_success(monkeypatch):
+    monkeypatch.setattr(
+        rlt_worker,
+        "collect_trajectory_replay_metrics",
+        lambda trajectories, reducer=None: {},
+    )
+    trajectory = Trajectory(
+        actions=torch.tensor([[[1.0]]]),
+        intervene_flags=torch.zeros((1, 1, 1), dtype=torch.bool),
+        rewards=torch.ones((1, 1, 1)),
+        dones=torch.zeros((2, 1, 1), dtype=torch.bool),
+        terminations=torch.tensor([[[False]], [[True]]]),
+        truncations=torch.zeros((2, 1, 1), dtype=torch.bool),
+        forward_inputs={"record_transition": torch.tensor([[[True]]])},
+        curr_obs={
+            "z_rl": torch.tensor([[[1.0]]]),
+            "proprio": torch.tensor([[[2.0]]]),
+            "ref_chunk": torch.tensor([[[3.0]]]),
+        },
+        next_obs={
+            "z_rl": torch.tensor([[[4.0]]]),
+            "proprio": torch.tensor([[[5.0]]]),
+            "ref_chunk": torch.tensor([[[6.0]]]),
+        },
+    )
+    harness = _ReplayHarness()
+    harness.online_successful_episodes = 0
+
+    added, completed = harness._ingest_rollout_trajectories([trajectory])
+
+    assert (added, completed) == (1, 1)
+    transition = harness.replay_buffer.added[0]
+    assert transition.dones.all()
+    assert transition.terminations.all()
+    assert harness.online_successful_episodes == 1
+    torch.testing.assert_close(transition.next_obs["z_rl"], transition.curr_obs["z_rl"])
+
+
+def test_replay_success_count_uses_persisted_terminations():
+    successful = Trajectory(
+        rewards=torch.ones((1, 1, 1)),
+        dones=torch.zeros((1, 1, 1), dtype=torch.bool),
+        terminations=torch.ones((1, 1, 1), dtype=torch.bool),
+    )
+    failed = Trajectory(
+        rewards=torch.zeros((1, 1, 1)),
+        dones=torch.zeros((1, 1, 1), dtype=torch.bool),
+        terminations=torch.ones((1, 1, 1), dtype=torch.bool),
+    )
+    trajectories = {0: successful, 1: failed}
+    harness = _ReplayHarness()
+    harness.replay_buffer = SimpleNamespace(
+        _trajectory_id_list=[0, 1],
+        _trajectory_index={
+            0: {"model_weights_id": "a"},
+            1: {"model_weights_id": "b"},
+        },
+        _load_trajectory=lambda trajectory_id, _: trajectories[trajectory_id],
+    )
+
+    assert harness._count_replay_successes() == 1
+
+
 class _TransitionCollector:
     def __init__(self):
         self.transitions = []
 
     def append_transitions(self, curr_obs, next_obs):
         self.transitions.append((curr_obs, next_obs))
+
+
+def test_intervention_replaces_reference_only_at_executed_steps():
+    current_obs = {
+        "z_rl": torch.tensor([[1.0]]),
+        "proprio": torch.tensor([[2.0]]),
+        "ref_chunk": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]]),
+    }
+    next_result = SimpleNamespace(
+        forward_inputs={
+            "rlt_transition_z_rl": torch.tensor([[4.0]]),
+            "rlt_transition_proprio": torch.tensor([[5.0]]),
+            "rlt_transition_ref_chunk": torch.tensor([[[0.5, 0.6], [0.7, 0.8]]]),
+        }
+    )
+    collector = _TransitionCollector()
+    pending_obs = [current_obs]
+
+    update_rlt_transitions(
+        0,
+        pending_obs,
+        [collector],
+        next_result,
+        cache_current=False,
+        intervene_actions=torch.tensor([[[-0.1, -0.2], [-0.3, -0.4]]]),
+        intervene_flags=torch.tensor([[False, True]]),
+    )
+
+    recorded_obs, _ = collector.transitions[0]
+    torch.testing.assert_close(
+        recorded_obs["ref_chunk"],
+        torch.tensor([[[0.1, 0.2], [-0.3, -0.4]]]),
+    )
 
 
 def test_final_bootstrap_row_is_not_recorded_as_executed_transition():
@@ -309,6 +408,25 @@ def test_final_bootstrap_row_is_not_recorded_as_executed_transition():
     assert len(collector.transitions) == 1
     assert pending_obs == [None]
     assert not bootstrap_result.forward_inputs["record_transition"].any()
+
+
+def test_noncritical_rollout_can_use_empty_actor_marker():
+    rollout = EmbodiedRolloutResult(max_episode_length=9000)
+    rollout.forward_inputs.extend(
+        [
+            {"record_transition": torch.tensor([[False]])},
+            {"record_transition": torch.tensor([[False]])},
+        ]
+    )
+
+    assert not EnvWorker._has_recorded_rlt_transition(rollout)
+    rollout.forward_inputs[1]["record_transition"][0, 0] = True
+    assert EnvWorker._has_recorded_rlt_transition(rollout)
+
+
+def test_chunk_prefetch_phase_uses_latest_flag():
+    assert not EnvWorker._rlt_phase_is_critical(torch.tensor([[False, False]]))
+    assert EnvWorker._rlt_phase_is_critical(torch.tensor([[False, True]]))
 
 
 def test_runner_step_schedule_adds_update_epoch_without_new_transitions():
@@ -348,3 +466,154 @@ def test_runner_step_schedule_adds_update_epoch_without_new_transitions():
     assert updates == 8
     assert metrics["rlt/desired_total_updates"] == 108
     assert metrics["rlt/train_every_runner_step"] == 1
+
+
+def test_transition_schedule_waits_for_four_new_transitions():
+    counters = {
+        "min_replay_size": 253,
+        "min_demo_size": 0,
+        "total_transitions_added": 253,
+        "total_episodes_added": 0,
+        "transitions_since_train": 3,
+        "episodes_since_train": 0,
+    }
+    harness = SimpleNamespace(
+        cfg=OmegaConf.create(
+            {
+                "algorithm": {
+                    "update_epoch": 8,
+                    "replay_buffer": {"min_buffer_size": 100},
+                }
+            }
+        ),
+        rlt_schedule_cfg={
+            "warmup_min_size": 250,
+            "warmup_post_collect_updates": 100,
+            "train_every_runner_step": False,
+            "train_every_transitions": 4,
+            "train_every_episodes": 0,
+            "max_updates_per_train_step": 20,
+        },
+        update_step=100,
+        _warmup_ready_total_transitions=250,
+        _warmup_ready_total_episodes=0,
+        pending_update_budget=0,
+        _global_rlt_counters=lambda: counters,
+    )
+
+    updates, _ = rlt_worker.RLTACFSDPPolicy._rlt_updates_to_run(harness)
+    assert updates == 0
+
+    counters["min_replay_size"] = 254
+    counters["total_transitions_added"] = 254
+    counters["transitions_since_train"] = 4
+    updates, metrics = rlt_worker.RLTACFSDPPolicy._rlt_updates_to_run(harness)
+
+    assert updates == 8
+    assert metrics["rlt/desired_total_updates"] == 108
+
+
+def test_transition_schedule_continues_from_resumed_update_step():
+    counters = {
+        "min_replay_size": 872,
+        "min_demo_size": 1243,
+        "total_transitions_added": 0,
+        "total_episodes_added": 0,
+        "transitions_since_train": 0,
+        "episodes_since_train": 0,
+    }
+    harness = SimpleNamespace(
+        cfg=OmegaConf.create(
+            {
+                "algorithm": {
+                    "update_epoch": 8,
+                    "replay_buffer": {"min_buffer_size": 250},
+                }
+            }
+        ),
+        rlt_schedule_cfg={
+            "warmup_min_size": 250,
+            "warmup_post_collect_updates": 200,
+            "train_every_runner_step": False,
+            "train_every_transitions": 4,
+            "train_every_episodes": 0,
+            "max_updates_per_train_step": 20,
+        },
+        update_step=376,
+        _warmup_ready_total_transitions=None,
+        _warmup_ready_total_episodes=None,
+        pending_update_budget=0,
+        _global_rlt_counters=lambda: counters,
+    )
+
+    updates, _ = rlt_worker.RLTACFSDPPolicy._rlt_updates_to_run(harness)
+    assert updates == 0
+
+    counters["total_transitions_added"] = 4
+    counters["transitions_since_train"] = 4
+    updates, metrics = rlt_worker.RLTACFSDPPolicy._rlt_updates_to_run(harness)
+
+    assert updates == 8
+    assert metrics["rlt/desired_total_updates"] == 384
+
+
+def test_sac_checkpoint_round_trips_update_step(tmp_path):
+    harness = SimpleNamespace(
+        _rank=0,
+        update_step=137,
+        online_successful_episodes=11,
+    )
+
+    EmbodiedSACFSDPPolicy._save_training_state(harness, tmp_path)
+    harness.update_step = 0
+    harness.online_successful_episodes = 0
+
+    assert EmbodiedSACFSDPPolicy._load_training_state(harness, tmp_path)
+    assert harness.update_step == 137
+    assert harness.online_successful_episodes == 11
+
+
+def test_actor_q_weight_waits_for_online_successes():
+    harness = SimpleNamespace(
+        cfg=OmegaConf.create(
+            {
+                "algorithm": {
+                    "bc_weight": 5.0,
+                    "q_weight": 0.05,
+                    "actor_weight_schedule": {
+                        "enable": True,
+                        "warmup_updates": 0,
+                        "ramp_updates": 0,
+                        "warmup_bc_weight": 5.0,
+                        "warmup_q_weight": 0.0,
+                        "online_bc_weight": 5.0,
+                        "online_q_weight": 0.05,
+                        "min_online_successes": 10,
+                        "ramp_online_successes": 10,
+                    },
+                }
+            }
+        ),
+        update_step=500,
+        online_successful_episodes=9,
+    )
+
+    _, q_weight, metrics = rlt_worker.RLTACLossMixin._actor_objective_weights(
+        harness
+    )
+    assert q_weight == 0.0
+    assert metrics["actor_weight_success_ramp_progress"] == 0.0
+
+    harness.online_successful_episodes = 14
+    _, q_weight, metrics = rlt_worker.RLTACLossMixin._actor_objective_weights(
+        harness
+    )
+    assert q_weight == pytest.approx(0.025)
+    assert metrics["actor_weight_success_ramp_progress"] == pytest.approx(0.5)
+
+    harness.online_successful_episodes = 19
+    _, q_weight, metrics = rlt_worker.RLTACLossMixin._actor_objective_weights(
+        harness
+    )
+    assert q_weight == pytest.approx(0.05)
+    assert metrics["actor_weight_success_ramp_progress"] == 1.0

@@ -36,11 +36,20 @@ class _FakeListener:
 
 
 class _FakeEnv(gym.Env):
+    def __init__(self):
+        self.action_chunk_complete = True
+        self.rollout_prefetch_sent = False
+        self.operator_home_calls = 0
+
     def reset(self, *, seed=None, options=None):
         return {"state": 0}, {}
 
     def step(self, action):
         return {"state": 1}, 0.25, False, False, {}
+
+    def operator_go_home(self):
+        self.operator_home_calls += 1
+        return {"state": 0}, {"operator_go_home": True}
 
 
 @pytest.fixture
@@ -72,14 +81,66 @@ def test_keyboard_rlt_switch_and_success_reward(wrapped_env):
     ("key", "event"),
     [("a", "failure"), ("q", "abort")],
 )
-def test_keyboard_rlt_failure_reward(wrapped_env, key, event):
+def test_keyboard_rlt_failure_reward_ends_only_rlt_segment(wrapped_env, key, event):
+    wrapped_env.listener.events = ["b"]
+    wrapped_env.step(None)
+
     wrapped_env.listener.events = [key]
     _, reward, terminated, _, info = wrapped_env.step(None)
     assert reward == 0.0
-    assert terminated
-    assert not info["rlt_segment_done"]
+    assert not terminated
+    assert info["rlt_segment_done"]
     assert not info["rlt_switch_flags"]
     assert info["rlt_policy_switch_event"] == event
+
+
+def test_multiple_rlt_segments_without_robot_reset(wrapped_env, monkeypatch):
+    ticks = iter(range(100))
+    monkeypatch.setattr(switch_module.time, "monotonic", lambda: next(ticks))
+    for terminal_key, expected_reward in (("a", 0.0), ("c", 1.0), ("q", 0.0)):
+        wrapped_env.listener.events = ["b"]
+        _, _, terminated, _, info = wrapped_env.step(None)
+        assert not terminated
+        assert info["rlt_switch_flags"]
+
+        wrapped_env.listener.events = [terminal_key]
+        _, reward, terminated, _, info = wrapped_env.step(None)
+        assert reward == expected_reward
+        assert not terminated
+        assert info["rlt_segment_done"]
+        assert not info["rlt_switch_flags"]
+
+
+def test_ctrl_1_aborts_active_segment_and_goes_home(wrapped_env):
+    wrapped_env.listener.events = ["b"]
+    wrapped_env.step(None)
+
+    wrapped_env.listener.events = ["ctrl+1"]
+    obs, reward, terminated, _, info = wrapped_env.step(None)
+
+    assert obs == {"state": 0}
+    assert reward == 0.0
+    assert not terminated
+    assert info["rlt_segment_done"]
+    assert not info["rlt_switch_flags"]
+    assert not info["operator_go_home_pending"]
+    assert info["operator_go_home"]
+    assert info["rlt_policy_switch_event"] == "operator_go_home_complete"
+    assert wrapped_env.unwrapped.operator_home_calls == 1
+
+
+def test_ctrl_1_waits_until_prefetched_chunk_is_consumed(wrapped_env):
+    wrapped_env.unwrapped.rollout_prefetch_sent = True
+    wrapped_env.listener.events = ["ctrl+1"]
+    _, _, _, _, info = wrapped_env.step(None)
+    assert info["operator_go_home_pending"]
+    assert wrapped_env.unwrapped.operator_home_calls == 0
+
+    wrapped_env.unwrapped.rollout_prefetch_sent = False
+    _, _, _, _, info = wrapped_env.step(None)
+    assert not info["operator_go_home_pending"]
+    assert info["rlt_policy_switch_event"] == "operator_go_home_complete"
+    assert wrapped_env.unwrapped.operator_home_calls == 1
 
 
 class _FakeChunkEnv:

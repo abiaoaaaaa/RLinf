@@ -26,7 +26,11 @@ _logger = get_logger()
 class KeyboardListener:
     """Headless keyboard listener backed by Linux evdev input devices."""
 
+    PREFERRED_DEVICE_PATH = (
+        "/dev/input/by-id/usb-HS6209_A4tech_2.4G_Wireless_Device-event-kbd"
+    )
     REQUIRED_KEY_NAMES = ("KEY_A", "KEY_B", "KEY_C", "KEY_Q")
+    CTRL_KEYS = frozenset({"Key.leftctrl", "Key.rightctrl"})
 
     def __init__(self):
         try:
@@ -45,6 +49,7 @@ class KeyboardListener:
         self.latest_data = {"key": None}
         # Edge-press queue so a sub-period tap isn't missed (get_key() only reports the held key).
         self._press_events: deque[str] = deque()
+        self._held_ctrl_keys: set[str] = set()
         self.device = self._open_keyboard_device()
 
         self.listener = threading.Thread(
@@ -67,6 +72,16 @@ class KeyboardListener:
                     "keyboard device. Point it to the correct /dev/input/eventX path."
                 )
             return device
+
+        if os.path.exists(self.PREFERRED_DEVICE_PATH):
+            device = self._open_device(self.PREFERRED_DEVICE_PATH, is_override=True)
+            if self._is_keyboard_device(device):
+                return device
+            device.close()
+            raise RuntimeError(
+                f"Preferred RLinf keyboard '{self.PREFERRED_DEVICE_PATH}' does not "
+                "provide the required A/B/C/Q keys."
+            )
 
         permission_denied_paths: list[str] = []
         keyboards: list = []  # (path, device) for every device that has KEY_A/B/C/Q
@@ -161,18 +176,7 @@ class KeyboardListener:
                     if key is None:
                         continue
 
-                    if event.value == 1:
-                        # Initial press only; autorepeat (value==2) does not re-enqueue.
-                        with self.state_lock:
-                            self.latest_data["key"] = key
-                            self._press_events.append(key)
-                    elif event.value == 2:
-                        with self.state_lock:
-                            self.latest_data["key"] = key
-                    elif event.value == 0:
-                        with self.state_lock:
-                            if self.latest_data["key"] == key:
-                                self.latest_data["key"] = None
+                    self._handle_key_event(key, event.value)
             except OSError as exc:
                 if exc.errno != errno.ENODEV:
                     _logger.error(
@@ -189,6 +193,7 @@ class KeyboardListener:
                 )
                 with self.state_lock:
                     self.latest_data["key"] = None
+                    self._held_ctrl_keys.clear()
                 try:
                     self.device.close()
                 except Exception:
@@ -202,6 +207,32 @@ class KeyboardListener:
                     except (FileNotFoundError, OSError):
                         continue
                 _logger.info("Keyboard device %s reopened.", device_path)
+
+    def _handle_key_event(self, key: str, value: int) -> None:
+        """Update held-key state and enqueue edge-triggered shortcuts."""
+        with self.state_lock:
+            if key in self.CTRL_KEYS:
+                if value in (1, 2):
+                    self._held_ctrl_keys.add(key)
+                elif value == 0:
+                    self._held_ctrl_keys.discard(key)
+                return
+
+            emitted_key = (
+                "ctrl+1" if key == "1" and self._held_ctrl_keys else key
+            )
+            if value == 1:
+                # Initial press only; autorepeat (value==2) does not re-enqueue.
+                self.latest_data["key"] = emitted_key
+                self._press_events.append(emitted_key)
+            elif value == 2:
+                self.latest_data["key"] = emitted_key
+            elif value == 0:
+                release_aliases = {key, emitted_key}
+                if key == "1":
+                    release_aliases.add("ctrl+1")
+                if self.latest_data["key"] in release_aliases:
+                    self.latest_data["key"] = None
 
     def _event_to_key(self, key_code: int) -> str | None:
         key_name = self._ecodes.bytype[self._ecodes.EV_KEY].get(key_code)

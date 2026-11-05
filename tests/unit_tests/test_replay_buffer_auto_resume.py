@@ -6,7 +6,33 @@
 import torch
 
 from rlinf.data.embodied_io_struct import Trajectory
-from rlinf.data.replay_buffer import TrajectoryReplayBuffer
+from rlinf.data.replay_buffer import TrajectoryCache, TrajectoryReplayBuffer
+
+
+def test_trajectory_cache_ignores_later_optional_metadata():
+    cache = TrajectoryCache(max_size=2)
+    cache.put(
+        0,
+        {
+            "rewards": torch.zeros(1, 1),
+            "forward_inputs": {"action": torch.zeros(1, 2)},
+        },
+    )
+    cache.put(
+        1,
+        {
+            "rewards": torch.ones(1, 1),
+            "forward_inputs": {
+                "action": torch.ones(1, 2),
+                "rtc_chunk_id": torch.ones(1, 1),
+            },
+        },
+    )
+
+    cached = cache.get(1)
+    assert torch.equal(cached["rewards"], torch.ones(1, 1))
+    assert torch.equal(cached["forward_inputs"]["action"], torch.ones(1, 2))
+    assert "rtc_chunk_id" not in cached["forward_inputs"]
 
 
 def _buffer(path):

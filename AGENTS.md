@@ -1,8 +1,27 @@
 # AGENTS.md
 
+## Remote server
+
+Before remote RLinf work, read [`../../REMOTE_SERVER.md`](../../REMOTE_SERVER.md).
+The canonical remote working copy is `/ssd/xlb/code/RLinf` via `ssh zkrh-56`;
+do not confuse it with `/ssd/RLinf`. Its OpenPI environment is
+`/ssd/xlb/code/RLinf/.venv_openpi`, and large logs/checkpoints must stay under
+`/ssd/xlb`. Recheck GPU compute processes before every run; never stop or reuse
+another user's job. The remote RLinf copy was not a Git worktree when last
+checked, so verify code parity rather than assuming branch operations are safe.
+
 Brief for AI coding agents working on RLinf. For full contribution flow, code style, and PR process see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 **Quick orientation:** RLinf is a distributed RL stack (embodied + reasoning + agent). It uses **Ray** for process management and **Hydra** for config. Single-machine runs use `cluster.num_nodes: 1`; multi-node needs Ray started on every node with `RLINF_NODE_RANK` set *before* `ray start`. Pre-commit runs Ruff (lint + format) and commit-check; use Google-style docstrings and type hints. All user-facing changes need tests and docs. If something is unclear, add a `TODO(agent)` and note the limitation.
+
+## Local Zadai RLT work
+
+If a request mentions Zadai, Marvin, RLT, OpenPI/Pi0.5, VLAHost, Stage1/Stage2,
+the real robot, expert/demo buffers, or keyboard intervention, first read
+[`docs/zadai_rlt_ai_handoff.md`](docs/zadai_rlt_ai_handoff.md). It is the local
+AI handoff and command index for the current `/home/xlb` setup. Treat the YAML
+and implementation as the behavior source of truth; the handoff contains a
+dated experiment snapshot and links to the longer design documents.
 
 ---
 

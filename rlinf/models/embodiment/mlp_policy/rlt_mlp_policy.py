@@ -37,6 +37,8 @@ class RLTMLPPolicy(MLPPolicy):
         add_q_head: bool = True,
         q_head_type: str = "default",
         fixed_std: float = 0.002,
+        residual_action: bool = False,
+        max_residual: float | list[float] | tuple[float, ...] | None = None,
     ):
         if not add_q_head:
             raise ValueError(
@@ -77,6 +79,29 @@ class RLTMLPPolicy(MLPPolicy):
         self.fixed_std = float(fixed_std)
         if self.fixed_std <= 0:
             raise ValueError(f"fixed_std must be positive, got {self.fixed_std}.")
+        self.residual_action = bool(residual_action)
+        if self.residual_action:
+            if max_residual is None:
+                raise ValueError("max_residual is required for residual_action=True.")
+            scale = torch.as_tensor(max_residual, dtype=torch.float32).flatten()
+            if scale.numel() == 1:
+                scale = scale.repeat(step_action_dim)
+            if scale.numel() != step_action_dim:
+                raise ValueError(
+                    "max_residual must be a scalar or contain one value per action "
+                    f"dimension, got {scale.numel()} values for {step_action_dim}."
+                )
+            if torch.any(scale < 0):
+                raise ValueError("max_residual values must be non-negative.")
+            self.register_buffer(
+                "residual_scale",
+                scale.repeat(chunk_len),
+            )
+            # A fresh residual actor initially reproduces the reference policy
+            # exactly. This also makes legacy absolute-policy checkpoints fail
+            # strict loading instead of silently changing their semantics.
+            torch.nn.init.zeros_(self.actor_mean.weight)
+            torch.nn.init.zeros_(self.actor_mean.bias)
 
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
@@ -152,9 +177,17 @@ class RLTMLPPolicy(MLPPolicy):
         action_mean = self.actor_mean(feat)
         action_std = torch.full_like(action_mean, self.fixed_std)
         probs = Normal(action_mean, action_std)
-        action = action_mean if deterministic else probs.rsample()
-        chunk_logprobs = probs.log_prob(action)
-        action = torch.tanh(action)
+        sampled_action = action_mean if deterministic else probs.rsample()
+        chunk_logprobs = probs.log_prob(sampled_action)
+        if self.residual_action:
+            reference = self._get_ref_chunk(obs)
+            action = torch.clamp(
+                reference + torch.tanh(sampled_action) * self.residual_scale,
+                min=-1.0,
+                max=1.0,
+            )
+        else:
+            action = torch.tanh(sampled_action)
         return action, chunk_logprobs, None
 
     def sac_q_forward(self, obs, actions, shared_feature=None, detach_encoder=False):
@@ -199,8 +232,11 @@ class RLTMLPPolicy(MLPPolicy):
         target_actions = self._flatten_batch(
             data["action"] if "action" in data else data["actions"]
         )
-        actor_state = self._actor_state(obs)
-        pred_actions = self.actor_mean(self.backbone(actor_state))
+        if self.residual_action:
+            pred_actions, _, _ = self.sac_forward(obs, deterministic=True)
+        else:
+            actor_state = self._actor_state(obs)
+            pred_actions = self.actor_mean(self.backbone(actor_state))
         return F.mse_loss(pred_actions, target_actions, reduction="none")
 
     @torch.inference_mode()

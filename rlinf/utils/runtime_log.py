@@ -15,10 +15,10 @@ from typing import Any
 
 
 def _json_default(value: Any):
-    if hasattr(value, "item"):
-        return value.item()
     if hasattr(value, "tolist"):
         return value.tolist()
+    if hasattr(value, "item"):
+        return value.item()
     return str(value)
 
 

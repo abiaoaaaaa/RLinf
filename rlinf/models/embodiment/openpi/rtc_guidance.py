@@ -35,6 +35,20 @@ class RTCGuidanceContext:
         return self.prev_model_actions[:, executed_horizon:, :]
 
 
+def select_rtc_action_window(
+    actions: torch.Tensor, *, start: int, length: int
+) -> torch.Tensor:
+    """Select a non-stale fixed-length action window from a full plan."""
+    start = int(start)
+    length = int(length)
+    if start < 0 or length < 1 or start + length > actions.shape[1]:
+        raise ValueError(
+            "RTC action window must fit the model horizon: "
+            f"start={start}, length={length}, horizon={actions.shape[1]}"
+        )
+    return actions[:, start : start + length]
+
+
 def build_rtc_target_and_mask(
     prev_remaining: torch.Tensor | None,
     horizon: int,

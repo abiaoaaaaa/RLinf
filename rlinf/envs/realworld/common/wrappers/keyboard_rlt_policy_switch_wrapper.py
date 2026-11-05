@@ -25,9 +25,12 @@ from rlinf.envs.realworld.common.keyboard.keyboard_listener import KeyboardListe
 class KeyboardRLTPolicySwitchWrapper(gym.Wrapper):
     """Control the RLT phase and sparse terminal reward from the keyboard.
 
-    ``b`` enters the RLT critical phase. ``c`` ends that phase with reward 1
-    and returns control to the VLA without resetting. ``a``/``q`` terminate
-    the robot episode with reward 0 so the existing auto-reset path can run.
+    ``b`` enters the RLT critical phase. ``c`` ends that phase with reward 1.
+    ``a``/``q`` end it with reward 0. ``Ctrl+1`` requests a safe operator
+    reset: stop policy motion, open the grippers, go home, wait, then resume.
+    All three terminal keys return control
+    to the VLA without terminating or resetting the physical robot episode,
+    so one long rollout can contain multiple independent RLT segments.
     """
 
     PEDAL_DEBOUNCE_S = 0.2
@@ -36,6 +39,7 @@ class KeyboardRLTPolicySwitchWrapper(gym.Wrapper):
         super().__init__(env)
         self.listener = KeyboardListener()
         self._rlt_switch_flags = False
+        self._operator_home_pending = False
         self._last_press_ts: dict[str, float] = {}
 
     @property
@@ -44,6 +48,7 @@ class KeyboardRLTPolicySwitchWrapper(gym.Wrapper):
 
     def reset(self, *, seed=None, options=None):
         self._rlt_switch_flags = False
+        self._operator_home_pending = False
         self._last_press_ts.clear()
         self.listener.pop_pressed_keys()
         return self.env.reset(seed=seed, options=options)
@@ -82,15 +87,46 @@ class KeyboardRLTPolicySwitchWrapper(gym.Wrapper):
             elif key in {"a", "q"}:
                 event = "failure" if key == "a" else "abort"
                 reward = 0.0
-                terminated = True
+                rlt_segment_done = True
                 self._rlt_switch_flags = False
                 self._log_info(
-                    f"Key '{key}' pressed; terminating the episode with reward 0."
+                    f"Key '{key}' pressed; ending the RLT segment with reward 0 "
+                    "without resetting the robot episode."
+                )
+                break
+            elif key == "ctrl+1":
+                event = "operator_go_home_requested"
+                reward = 0.0
+                rlt_segment_done = self._rlt_switch_flags
+                self._rlt_switch_flags = False
+                self._operator_home_pending = True
+                self._log_info(
+                    "Ctrl+1 pressed; pausing policy and scheduling gripper-open "
+                    "go-home at a safe action-chunk boundary."
                 )
                 break
 
+        base_env = self._base_env()
+        if (
+            self._operator_home_pending
+            and bool(getattr(base_env, "action_chunk_complete", True))
+        ):
+            # If RTC already prefetched the next chunk, consume that ordinary
+            # chunk first. The pending flag suppresses its own prefetch, so the
+            # following boundary is guaranteed not to resume stale actions
+            # after homing.
+            if not bool(getattr(base_env, "rollout_prefetch_sent", False)):
+                obs, home_info = base_env.operator_go_home()
+                info.update(home_info)
+                self._operator_home_pending = False
+                event = "operator_go_home_complete"
+                self._log_info(
+                    "Ctrl+1 operator reset complete; policy inference may resume."
+                )
+
         info["rlt_switch_flags"] = self._rlt_switch_flags
         info["rlt_segment_done"] = rlt_segment_done
+        info["operator_go_home_pending"] = self._operator_home_pending
         info["rlt_policy_switch_event"] = event
         return obs, reward, terminated, truncated, info
 

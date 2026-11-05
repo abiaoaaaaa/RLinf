@@ -350,7 +350,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             inputs["tokenized_prompt_mask"] = obs["tokenized_prompt_mask"]
         return inputs
 
-    def output_transform(self, outputs):
+    def output_transform(self, outputs, *, action_start: int = 0):
         # split & transform
         batch_size = outputs["actions"].shape[0]
         transformed_samples = []
@@ -363,7 +363,15 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             lambda *torch_arr: torch.from_numpy(np.asarray(torch_arr).copy()),
             *transformed_samples,
         )
-        outputs["actions"] = outputs["actions"][:, : self.config.action_chunk]
+        from rlinf.models.embodiment.openpi.rtc_guidance import (
+            select_rtc_action_window,
+        )
+
+        outputs["actions"] = select_rtc_action_window(
+            outputs["actions"],
+            start=action_start,
+            length=self.config.action_chunk,
+        )
         return outputs
 
     def forward(self, forward_type=ForwardType.DEFAULT, **kwargs):
@@ -592,6 +600,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     def extract_rlt_obs(
         self,
         env_obs: dict[str, Any],
+        *,
+        rtc_context: RTCGuidanceContext | None = None,
+        action_start: int = 0,
+        return_rtc_model_actions: bool = False,
     ) -> dict[str, torch.Tensor]:
         if not self.config.use_rlt or not hasattr(self, "rlt_module"):
             raise ValueError("extract_rlt_obs requires openpi.use_rlt=True.")
@@ -623,9 +635,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             past_key_values,
             mode="eval",
             compute_values=False,
+            rtc_context=rtc_context,
         )
         ref_chunk = self.output_transform(
-            {"actions": outputs["actions"], "state": observation.state}
+            {"actions": outputs["actions"], "state": observation.state},
+            action_start=action_start,
         )["actions"]
         config_name = str(self.config.config_name).lower()
         rlt_action_space = self.config.rlt_action_space
@@ -653,11 +667,14 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if not torch.is_tensor(proprio):
             proprio = torch.as_tensor(proprio)
 
-        return {
+        result = {
             "z_rl": z_rl,
             "proprio": proprio.to(device=z_rl.device, dtype=torch.float32),
             "ref_chunk": ref_chunk.to(device=z_rl.device, dtype=torch.float32),
         }
+        if return_rtc_model_actions:
+            result["_rtc_model_actions"] = outputs["actions"].detach()
+        return result
 
     def prepare_dagger_sft_batch(self, batch):
         """Prepare replay-buffer samples for DAgger SFT updates."""
@@ -1071,6 +1088,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         noise=None,
         mode="train",
         compute_values=True,
+        rtc_context: RTCGuidanceContext | None = None,
     ) -> torch.Tensor:
         bsize = state.shape[0]
         device = state.device
@@ -1121,6 +1139,21 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         # collect nft states for nft algorithm
         nft_state = self._init_nft_state(collect_nft_state, x_t, num_steps, device)
 
+        rtc_target = rtc_mask = None
+        if rtc_context is not None and self.config.rtc_enabled:
+            from rlinf.models.embodiment.openpi.rtc_guidance import (
+                build_rtc_target_and_mask,
+            )
+
+            rtc_target, rtc_mask = build_rtc_target_and_mask(
+                prev_remaining=rtc_context.get_prev_remaining(),
+                horizon=self.config.action_horizon,
+                action_dim=self.config.action_dim,
+                delay_steps=rtc_context.delay_steps,
+                device=device,
+                dtype=x_t.dtype,
+            )
+
         # denoise step
         for idx in range(num_steps):
             # sample mean var val
@@ -1139,6 +1172,13 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 num_steps,
                 compute_values,
             )
+            if rtc_target is not None and bool(rtc_mask.any()):
+                tau = torch.tensor(idx / num_steps, device=device, dtype=x_t.dtype)
+                scale = torch.clamp(
+                    (1.0 - tau) / torch.clamp(tau + 1e-4, min=1e-4),
+                    max=float(self.config.rtc_guidance_clip),
+                )
+                x_t_mean = x_t_mean + scale * (rtc_target - x_t_mean) * rtc_mask
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t_mean + self.sample_noise(x_t.shape, device) * x_t_std
             self._update_nft_state(nft_state, idx, x_t_prev, v_t, x_t, sample_method)
